@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Central Gás Entregador</string>
+    <string name="title_activity_main">Central Gás Entregador</string>
+    <string name="package_name">com.centralgas.entregador</string>
+    <string name="custom_url_scheme">com.centralgas.entregador</string>
+</resources>
