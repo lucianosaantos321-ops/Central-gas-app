@@ -1,0 +1,17 @@
+android/
+BACKUP_*/
+PRODUCAO_*/
+PUBLICACAO_*/
+*.zip
+*.jks
+*.keystore
+android/keystore.properties
+android/app/google-services.json
+firebase-service-account.json
+central-gas-site/
+docs/
+scripts/
+assets/
+notification-dump.txt
+gerar_alerta_premium.js
+cg_*.png
