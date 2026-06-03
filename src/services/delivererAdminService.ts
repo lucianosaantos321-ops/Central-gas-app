@@ -1,3 +1,5 @@
+import { queueRemoteDocumentSave } from "./remoteAppStateService";
+
 type ManualDelivererAdminState = {
   byDeliverer: Record<
     string,
@@ -69,6 +71,7 @@ export const delivererAdminService = {
       updatedAt: now(),
     };
     safeWrite(db);
+    queueRemoteDocumentSave("deliverer_admin_controls", db);
   },
 
   clearManualBlock(entregadorId: string) {
@@ -82,6 +85,7 @@ export const delivererAdminService = {
       updatedAt: now(),
     };
     safeWrite(db);
+    queueRemoteDocumentSave("deliverer_admin_controls", db);
   },
 
   getAll() {

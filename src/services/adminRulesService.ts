@@ -1,4 +1,5 @@
 import type { AdminRuleState } from "../types";
+import { queueRemoteDocumentSave } from "./remoteAppStateService";
 
 const STORAGE_KEY = "cg_admin_rules_v1";
 
@@ -77,6 +78,7 @@ export const adminRulesService = {
     }
 
     safeWrite(next);
+    queueRemoteDocumentSave("admin_rules", next);
     return next;
   },
 };

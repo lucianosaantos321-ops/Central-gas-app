@@ -1,10 +1,58 @@
 import type { Pedido, StatusPedido } from "../types";
+import type { RealtimeChannel } from "@supabase/supabase-js";
+import { appLogger } from "./appLogger";
 import { emitPedidoUpdate } from "./realtimeBus";
 import { COMISSAO_APP_POR_ENTREGA } from "./financeService";
+import { delivererService } from "./delivererService";
+import { schedulePushDispatch } from "./remotePushDispatchService";
 import { supabase } from "./supabase";
+import {
+  readLocalUserDocumentPayload,
+  type ClientProfileDocument,
+} from "./userStateSchemas";
+
+const PEDIDO_READ_TIMEOUT_MS = 8000;
+const PEDIDO_WRITE_TIMEOUT_MS = 15000;
+const PEDIDO_LIST_CACHE_MS = 2500;
+const PEDIDO_ITEM_CACHE_MS = 1500;
+
+type CacheEntry<T> = {
+  value: T;
+  expiresAt: number;
+};
+
+type PedidoRealtimeCallback = (pedidoId?: string) => void;
+
+let pedidosListCache: CacheEntry<Pedido[]> | null = null;
+let pedidosListInflight: Promise<Pedido[] | null> | null = null;
+const pedidoByIdCache = new Map<string, CacheEntry<Pedido | null>>();
+const pedidoByIdInflight = new Map<string, Promise<Pedido | null | undefined>>();
+const pedidoRealtimeListeners = new Set<PedidoRealtimeCallback>();
+let pedidoRealtimeChannel: RealtimeChannel | null = null;
 
 function gerarId() {
   return crypto.randomUUID();
+}
+
+async function withTimeout<T>(
+  promise: PromiseLike<T>,
+  ms: number,
+  errorCode: string
+): Promise<T> {
+  let timer: number | null = null;
+
+  return await Promise.race([
+    Promise.resolve(promise).finally(() => {
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    }),
+    new Promise<T>((_, reject) => {
+      timer = window.setTimeout(() => {
+        reject(new Error(errorCode));
+      }, ms);
+    }),
+  ]);
 }
 
 function agora() {
@@ -41,15 +89,11 @@ function toNullableText(value: unknown) {
   return normalized || null;
 }
 
-function generateDeliveryPin(pedidoId: string, clienteTelefone?: string | null) {
+function generateDeliveryPin(_pedidoId: string, clienteTelefone?: string | null) {
   const digits = onlyDigits(clienteTelefone || "");
   const phoneTail = digits.slice(-2) || "00";
-  const randomPart = String(Math.floor(1000 + Math.random() * 9000));
-  const pedidoTail =
-    pedidoId.replace(/\D/g, "").slice(-2) ||
-    String(pedidoId.length).padStart(2, "0");
-
-  return `${randomPart}${phoneTail}${pedidoTail}`.slice(0, 6);
+  const randomPart = String(Math.floor(10 + Math.random() * 90));
+  return `${randomPart}${phoneTail}`.slice(0, 4);
 }
 
 function normalizeHistorico(value: unknown) {
@@ -66,7 +110,60 @@ function ensureArray<T>(value: unknown): T[] {
   return Array.isArray(value) ? (value as T[]) : [];
 }
 
-function buildPedidoRow(pedido: Pedido) {
+function normalizePayloadPedido(data: unknown) {
+  if (Array.isArray(data)) {
+    return data[0] ? normalizeRemotePedido(data[0]) : null;
+  }
+
+  if (data && typeof data === "object") {
+    return normalizeRemotePedido(data);
+  }
+
+  return null;
+}
+
+function readCacheEntry<T>(entry: CacheEntry<T> | null) {
+  if (!entry) return undefined;
+  if (entry.expiresAt <= Date.now()) return undefined;
+  return entry.value;
+}
+
+function rememberPedidoCache(pedido: Pedido | null) {
+  const id = String(pedido?.id ?? "").trim();
+  if (!id) return;
+
+  pedidoByIdCache.set(id, {
+    value: pedido,
+    expiresAt: Date.now() + PEDIDO_ITEM_CACHE_MS,
+  });
+}
+
+function rememberPedidoListCache(pedidos: Pedido[]) {
+  pedidosListCache = {
+    value: pedidos,
+    expiresAt: Date.now() + PEDIDO_LIST_CACHE_MS,
+  };
+
+  for (const pedido of pedidos) {
+    rememberPedidoCache(pedido);
+  }
+}
+
+function invalidatePedidoCaches(pedidoId?: string) {
+  pedidosListCache = null;
+  pedidosListInflight = null;
+
+  if (pedidoId) {
+    pedidoByIdCache.delete(String(pedidoId).trim());
+    pedidoByIdInflight.delete(String(pedidoId).trim());
+    return;
+  }
+
+  pedidoByIdCache.clear();
+  pedidoByIdInflight.clear();
+}
+
+function buildPedidoPayload(pedido: Pedido) {
   return {
     id: pedido.id,
     cliente_id: toNullableUuid((pedido as any).clienteId),
@@ -114,12 +211,36 @@ function buildPedidoRow(pedido: Pedido) {
   };
 }
 
+function ensureRpcPedido(payload: Pedido | null, message: string) {
+  if (!payload) {
+    throw new Error(message);
+  }
+
+  invalidatePedidoCaches(payload.id);
+  rememberPedidoCache(payload);
+  emitPedidoUpdate(payload.id);
+  return payload;
+}
+
+function ensureRpcPedidoWithPushDispatch(
+  payload: Pedido | null,
+  message: string,
+  reason = "pedido_mutation"
+) {
+  const pedido = ensureRpcPedido(payload, message);
+
+  schedulePushDispatch({
+    reason,
+    limit: 30,
+  });
+
+  return pedido;
+}
+
 export function normalizeRemotePedido(row: any): Pedido {
   return {
     id: String(row?.id ?? ""),
-    clienteId: String(
-      row?.clienteId ?? row?.cliente_id ?? "cliente_local"
-    ),
+    clienteId: String(row?.clienteId ?? row?.cliente_id ?? ""),
     entregadorId: row?.entregadorId ?? row?.entregador_id ?? null,
     status: (row?.status ?? "criado") as StatusPedido,
     historico: normalizeHistorico(row?.historico),
@@ -183,76 +304,182 @@ export function normalizeRemotePedido(row: any): Pedido {
   } as Pedido;
 }
 
-async function syncPedidoToSupabase(pedido: Pedido) {
-  try {
-    const row = buildPedidoRow(pedido);
+async function listarPedidosSupabase(
+  force = false
+): Promise<Pedido[] | null> {
+  const cached = !force ? readCacheEntry(pedidosListCache) : undefined;
+  if (cached !== undefined) return cached;
 
-    const { error } = await supabase.from("pedidos").upsert([row], {
-      onConflict: "id",
-    });
-
-    if (error) {
-      console.error("Supabase syncPedidoToSupabase error:", {
-        message: error.message,
-        details: error.details,
-        hint: error.hint,
-        code: error.code,
-      });
-    }
-  } catch (error) {
-    console.error("Supabase syncPedidoToSupabase exception:", error);
+  if (!force && pedidosListInflight) {
+    return pedidosListInflight;
   }
-}
 
-async function listarPedidosSupabase(): Promise<Pedido[] | null> {
-  try {
-    const { data, error } = await supabase
-      .from("pedidos")
-      .select("*")
-      .order("updated_at", { ascending: false });
+  pedidosListInflight = (async () => {
+    try {
+      const { data, error } = await withTimeout(
+        supabase.rpc("list_visible_delivery_orders"),
+        PEDIDO_READ_TIMEOUT_MS,
+        "PEDIDOS_LIST_TIMEOUT"
+      );
 
-    if (error) {
-      console.error("Supabase listarPedidosRemotos error:", {
-        message: error.message,
-        details: error.details,
-        hint: error.hint,
-        code: error.code,
-      });
+      if (error) {
+        appLogger.error("pedido_service", "list_visible_orders_failed", error, {
+          message: error.message,
+          details: error.details,
+          hint: error.hint,
+          code: error.code,
+        });
+        return null;
+      }
+
+      const normalized = Array.isArray(data) ? data.map(normalizeRemotePedido) : [];
+      rememberPedidoListCache(normalized);
+      return normalized;
+    } catch (error) {
+      appLogger.error("pedido_service", "list_visible_orders_exception", error);
       return null;
+    } finally {
+      pedidosListInflight = null;
     }
+  })();
 
-    return Array.isArray(data) ? data.map(normalizeRemotePedido) : [];
-  } catch (error) {
-    console.error("Supabase listarPedidosRemotos exception:", error);
-    return null;
-  }
+  return pedidosListInflight;
 }
 
 async function buscarPedidoSupabase(
-  pedidoId: string
+  pedidoId: string,
+  force = false
 ): Promise<Pedido | null | undefined> {
-  try {
-    const { data, error } = await supabase
-      .from("pedidos")
-      .select("*")
-      .eq("id", pedidoId)
-      .maybeSingle();
+  const normalizedId = String(pedidoId || "").trim();
+  if (!normalizedId) return null;
 
-    if (error) {
-      console.error("Supabase buscarPedidoRemotoPorId error:", {
-        message: error.message,
-        details: error.details,
-        hint: error.hint,
-        code: error.code,
+  const cached = !force ? readCacheEntry(pedidoByIdCache.get(normalizedId) ?? null) : undefined;
+  if (cached !== undefined) return cached;
+
+  const listCached = !force ? readCacheEntry(pedidosListCache) : undefined;
+  if (listCached !== undefined) {
+    const fromList = listCached.find((pedido) => String(pedido.id) === normalizedId) ?? null;
+    if (fromList) {
+      rememberPedidoCache(fromList);
+    } else {
+      pedidoByIdCache.set(normalizedId, {
+        value: null,
+        expiresAt: Date.now() + PEDIDO_ITEM_CACHE_MS,
+      });
+    }
+    return fromList;
+  }
+
+  if (!force) {
+    const inflight = pedidoByIdInflight.get(normalizedId);
+    if (inflight) return inflight;
+  }
+
+  const request = (async () => {
+    try {
+      const { data, error } = await withTimeout(
+        supabase.rpc("get_visible_delivery_order", {
+          p_pedido_id: normalizedId,
+        }),
+        PEDIDO_READ_TIMEOUT_MS,
+        "PEDIDO_FETCH_TIMEOUT"
+      );
+
+      if (error) {
+        appLogger.error("pedido_service", "get_visible_order_failed", error, {
+          pedidoId: normalizedId,
+          message: error.message,
+          details: error.details,
+          hint: error.hint,
+          code: error.code,
+        });
+        return undefined;
+      }
+
+      const normalized = normalizePayloadPedido(data);
+      if (normalized === null) {
+        pedidoByIdCache.set(normalizedId, {
+          value: null,
+          expiresAt: Date.now() + PEDIDO_ITEM_CACHE_MS,
+        });
+      } else {
+        rememberPedidoCache(normalized);
+      }
+      return normalized;
+    } catch (error) {
+      appLogger.error("pedido_service", "get_visible_order_exception", error, {
+        pedidoId: normalizedId,
       });
       return undefined;
+    } finally {
+      pedidoByIdInflight.delete(normalizedId);
     }
+  })();
 
-    return data ? normalizeRemotePedido(data) : null;
-  } catch (error) {
-    console.error("Supabase buscarPedidoRemotoPorId exception:", error);
-    return undefined;
+  pedidoByIdInflight.set(normalizedId, request);
+  return request;
+}
+
+function notifyPedidoRealtime(changedId?: string) {
+  invalidatePedidoCaches(changedId);
+
+  for (const listener of pedidoRealtimeListeners) {
+    try {
+      listener(changedId);
+    } catch (error) {
+      appLogger.error("pedido_service", "realtime_listener_failed", error, {
+        pedidoId: changedId ?? null,
+      });
+    }
   }
+
+  emitPedidoUpdate(changedId);
+}
+
+function ensurePedidosRealtimeChannel() {
+  if (pedidoRealtimeChannel) return;
+
+  try {
+    pedidoRealtimeChannel = supabase
+      .channel("pedidos-operacao-shared")
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "pedidos",
+        },
+        (payload) => {
+          const changedId = String(
+            (payload.new as any)?.id ?? (payload.old as any)?.id ?? ""
+          ).trim();
+
+          notifyPedidoRealtime(changedId || undefined);
+        }
+      )
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          notifyPedidoRealtime();
+        }
+      });
+  } catch (error) {
+    appLogger.error("pedido_service", "subscribe_realtime_failed", error);
+  }
+}
+
+function subscribePedidosRealtime(callback: PedidoRealtimeCallback) {
+  pedidoRealtimeListeners.add(callback);
+  ensurePedidosRealtimeChannel();
+  window.setTimeout(() => callback(), 0);
+
+  return () => {
+    pedidoRealtimeListeners.delete(callback);
+
+    if (!pedidoRealtimeListeners.size && pedidoRealtimeChannel) {
+      void supabase.removeChannel(pedidoRealtimeChannel);
+      pedidoRealtimeChannel = null;
+    }
+  };
 }
 
 export const pedidoService = {
@@ -281,14 +508,21 @@ export const pedidoService = {
       | "comissaoGeradaEm"
     >
   ): Pedido {
+    const clientProfile = readLocalUserDocumentPayload(
+      "client_profile"
+    ) as ClientProfileDocument;
     const clienteNome =
-      (dados as any).clienteNome || safeGet("cg_cliente_nome", "Cliente");
+      (dados as any).clienteNome ||
+      clientProfile.nome ||
+      safeGet("cg_cliente_nome", "Cliente");
     const clienteTelefone =
-      (dados as any).clienteTelefone || safeGet("cg_cliente_telefone", "");
+      (dados as any).clienteTelefone ||
+      onlyDigits(clientProfile.telefone) ||
+      safeGet("cg_cliente_telefone", "");
     const createdAt = agora();
     const id = gerarId();
 
-    const novo: Pedido = {
+    return {
       ...dados,
       clienteNome,
       clienteTelefone,
@@ -313,10 +547,6 @@ export const pedidoService = {
       comissaoGerada: false,
       comissaoGeradaEm: null,
     } as Pedido;
-
-    void syncPedidoToSupabase(novo);
-    emitPedidoUpdate();
-    return novo;
   },
 
   atualizarStatus(pedido: Pedido, novoStatus: StatusPedido): Pedido {
@@ -326,7 +556,7 @@ export const pedidoService = {
     const ultimoStatus = historicoBase[historicoBase.length - 1]?.status;
     const updatedAt = agora();
 
-    const updated: Pedido = {
+    return {
       ...pedido,
       status: novoStatus,
       historico:
@@ -335,15 +565,256 @@ export const pedidoService = {
           : [...historicoBase, { status: novoStatus, data: updatedAt }],
       updatedAt,
     };
-
-    void syncPedidoToSupabase(updated);
-    emitPedidoUpdate();
-    return updated;
   },
 
-  syncPedido(pedido: Pedido) {
-    const normalized = normalizeRemotePedido(pedido);
-    void syncPedidoToSupabase(normalized);
+  syncPedido(_pedido: Pedido) {
+    appLogger.warn(
+      "pedido_service",
+      "sync_pedido_disabled",
+      "pedidoService.syncPedido foi desativado. Use RPCs seguras."
+    );
+  },
+
+  async salvarPedidoRemoto(pedido: Pedido): Promise<Pedido | null> {
+    try {
+      const payload = {
+        ...buildPedidoPayload(pedido),
+        status: null,
+        historico: null,
+        created_at: null,
+        updated_at: null,
+      };
+      const { data, error } = await withTimeout(
+        supabase.rpc("create_delivery_order", {
+          p_payload: payload,
+        }),
+        PEDIDO_WRITE_TIMEOUT_MS,
+        "CREATE_DELIVERY_ORDER_TIMEOUT"
+      );
+
+      if (error) {
+        error.message = JSON.stringify({
+          code: error.code,
+          message: error.message,
+          details: error.details,
+          hint: error.hint,
+        });
+        if (error.message) {
+          throw new Error(error.message);
+        }
+        appLogger.error("pedido_service", "create_delivery_order_failed", error, {
+          message: error.message,
+          details: error.details,
+          hint: error.hint,
+          code: error.code,
+        });
+        throw new Error("Não foi possível criar o pedido.");
+      }
+
+      return ensureRpcPedidoWithPushDispatch(
+        normalizePayloadPedido(data),
+        "Não foi possível criar o pedido."
+      );
+    } catch (error) {
+      appLogger.error("pedido_service", "create_delivery_order_exception", error);
+      throw error;
+    }
+  },
+
+  async atualizarStatusRemoto(
+    pedidoId: string,
+    novoStatus: StatusPedido
+  ): Promise<Pedido | null> {
+    const id = String(pedidoId || "").trim();
+    if (!id) return null;
+
+    const { data, error } = await withTimeout(
+      supabase.rpc("update_delivery_order_status", {
+        p_pedido_id: id,
+        p_status: novoStatus,
+      }),
+      PEDIDO_WRITE_TIMEOUT_MS,
+      "UPDATE_DELIVERY_ORDER_STATUS_TIMEOUT"
+    );
+
+    if (error) {
+      appLogger.error("pedido_service", "update_delivery_order_status_failed", error, {
+        pedidoId: id,
+        nextStatus: novoStatus,
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code,
+      });
+      throw new Error("Não foi possível atualizar o status do pedido.");
+    }
+
+    return ensureRpcPedidoWithPushDispatch(
+      normalizePayloadPedido(data),
+      "Não foi possível atualizar o status do pedido."
+    );
+  },
+
+  async atribuirEntregadorRemoto(
+    pedidoId: string,
+    entregadorId: string
+  ): Promise<Pedido | null> {
+    const id = String(pedidoId || "").trim();
+    const entregador = String(entregadorId || "").trim();
+
+    if (!id || !entregador) return null;
+
+    const delivererOnline = await delivererService.getOnlineStatus(entregador);
+    if (delivererOnline === false) {
+      throw new Error("Entregador offline nao pode aceitar pedidos.");
+    }
+
+    const { data, error } = await withTimeout(
+      supabase.rpc("assign_delivery_order", {
+        p_pedido_id: id,
+        p_entregador_id: entregador,
+      }),
+      PEDIDO_WRITE_TIMEOUT_MS,
+      "ASSIGN_DELIVERY_ORDER_TIMEOUT"
+    );
+
+    if (error) {
+      appLogger.error("pedido_service", "assign_delivery_order_failed", error, {
+        pedidoId: id,
+        entregadorId: entregador,
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code,
+      });
+      throw new Error(
+        "Pedido ja foi aceito por outro entregador ou nao esta mais disponivel."
+      );
+    }
+
+    return ensureRpcPedidoWithPushDispatch(
+      normalizePayloadPedido(data),
+      "Pedido ja foi aceito por outro entregador ou nao esta mais disponivel."
+    );
+  },
+
+  async cancelarPedidoRemoto(input: {
+    pedidoId: string;
+    canceladoPor: string;
+    motivoCancelamento: string;
+    observacaoCancelamento?: string | null;
+    lat?: number | null;
+    lng?: number | null;
+  }): Promise<Pedido | null> {
+    const id = String(input.pedidoId || "").trim();
+    if (!id) return null;
+
+    const { data, error } = await withTimeout(
+      supabase.rpc("cancel_delivery_order", {
+        p_pedido_id: id,
+        p_cancelado_por: String(input.canceladoPor || "").trim(),
+        p_motivo_cancelamento: String(input.motivoCancelamento || "").trim(),
+        p_observacao_cancelamento: input.observacaoCancelamento ?? null,
+        p_cancelamento_lat:
+          Number.isFinite(Number(input.lat)) ? Number(input.lat) : null,
+        p_cancelamento_lng:
+          Number.isFinite(Number(input.lng)) ? Number(input.lng) : null,
+      }),
+      PEDIDO_WRITE_TIMEOUT_MS,
+      "CANCEL_DELIVERY_ORDER_TIMEOUT"
+    );
+
+    if (error) {
+      appLogger.error("pedido_service", "cancel_delivery_order_failed", error, {
+        pedidoId: id,
+        canceladoPor: input.canceladoPor,
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code,
+      });
+      throw new Error("Não foi possível cancelar o pedido.");
+    }
+
+    return ensureRpcPedidoWithPushDispatch(
+      normalizePayloadPedido(data),
+      "Não foi possível cancelar o pedido."
+    );
+  },
+
+  async confirmarEntregaRemota(
+    pedidoId: string,
+    pin: string
+  ): Promise<Pedido | null> {
+    const id = String(pedidoId || "").trim();
+    const normalizedPin = String(pin || "").replace(/\D/g, "").slice(0, 4);
+    if (!id || !normalizedPin) return null;
+
+    const { data, error } = await withTimeout(
+      supabase.rpc("confirm_delivery_order", {
+        p_pedido_id: id,
+        p_pin: normalizedPin,
+        p_method: "pin",
+      }),
+      PEDIDO_WRITE_TIMEOUT_MS,
+      "CONFIRM_DELIVERY_ORDER_TIMEOUT"
+    );
+
+    if (error) {
+      appLogger.error("pedido_service", "confirm_delivery_order_failed", error, {
+        pedidoId: id,
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code,
+      });
+      throw new Error("PIN inválido ou pedido não disponível para confirmação.");
+    }
+
+    return ensureRpcPedidoWithPushDispatch(
+      normalizePayloadPedido(data),
+      "Não foi possível confirmar a entrega."
+    );
+  },
+
+  async confirmarEntregaManualRemota(
+    pedidoId: string
+  ): Promise<Pedido | null> {
+    const id = String(pedidoId || "").trim();
+    if (!id) return null;
+
+    const { data, error } = await withTimeout(
+      supabase.rpc("confirm_delivery_order", {
+        p_pedido_id: id,
+        p_pin: null,
+        p_method: "manual",
+      }),
+      PEDIDO_WRITE_TIMEOUT_MS,
+      "CONFIRM_DELIVERY_ORDER_MANUAL_TIMEOUT"
+    );
+
+    if (error) {
+      appLogger.error("pedido_service", "confirm_delivery_order_manual_failed", error, {
+        pedidoId: id,
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code,
+      });
+      throw new Error("Não foi possível registrar a entrega manual.");
+    }
+
+    return ensureRpcPedidoWithPushDispatch(
+      normalizePayloadPedido(data),
+      "Não foi possível registrar a entrega manual."
+    );
+  },
+
+  async atualizarCamposRemotos(
+    _pedidoId: string,
+    _patch: Partial<Pedido>
+  ): Promise<Pedido | null> {
+    throw new Error("Atualização direta desativada. Use RPC específica.");
   },
 
   normalizeRemotePedido,
@@ -351,6 +822,10 @@ export const pedidoService = {
   async listarPedidosRemotos(): Promise<Pedido[]> {
     const remote = await listarPedidosSupabase();
     return remote ?? [];
+  },
+
+  async listarPedidosPrimarios(): Promise<Pedido[] | null> {
+    return listarPedidosSupabase();
   },
 
   async buscarPedidoRemotoPorId(pedidoId: string): Promise<Pedido | null> {
@@ -361,4 +836,14 @@ export const pedidoService = {
     if (remote === undefined) return null;
     return remote;
   },
+
+  async buscarPedidoPrimarioPorId(
+    pedidoId: string
+  ): Promise<Pedido | null | undefined> {
+    const id = String(pedidoId || "").trim();
+    if (!id) return null;
+    return buscarPedidoSupabase(id);
+  },
+
+  subscribePedidosRealtime,
 };

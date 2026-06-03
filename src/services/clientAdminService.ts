@@ -1,3 +1,5 @@
+import { queueRemoteDocumentSave } from "./remoteAppStateService";
+
 type ClientAdminStatus = "normal" | "atencao" | "bloqueado";
 
 type ClientAdminRecord = {
@@ -77,6 +79,7 @@ export const clientAdminService = {
     };
 
     safeWrite(db);
+    queueRemoteDocumentSave("client_admin_controls", db);
     return db.byClientKey[key];
   },
 
@@ -95,6 +98,7 @@ export const clientAdminService = {
     };
 
     safeWrite(db);
+    queueRemoteDocumentSave("client_admin_controls", db);
     return db.byClientKey[key];
   },
 

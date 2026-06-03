@@ -40,7 +40,7 @@ function normalizeProduct(input: Partial<ProdutoLoja>): ProdutoLoja {
     nome: String(input.nome || "Produto"),
     preco: Number(input.preco || 0),
     imagem: input.imagem ?? null,
-    categoria: input.categoria ?? "gás",
+    categoria: input.categoria ?? "gas",
     descricao: input.descricao ?? null,
     unidade: input.unidade ?? "un",
     badge: input.badge ?? null,
@@ -53,19 +53,29 @@ function normalizeProduct(input: Partial<ProdutoLoja>): ProdutoLoja {
 const DEFAULT_PRODUCTS: ProdutoLoja[] = [
   normalizeProduct({
     id: "p13",
-    nome: "Botijão P13",
+    nome: "Botijao P13",
     preco: 120,
-    categoria: "gás",
-    descricao: "Botijão residencial mais vendido.",
+    categoria: "gas",
+    descricao: "Botijao residencial mais vendido.",
     unidade: "un",
     badge: "Mais vendido",
     ativo: true,
   }),
   normalizeProduct({
+    id: "p20",
+    nome: "Botijao P20",
+    preco: 180,
+    categoria: "gas",
+    descricao: "Capacidade intermediaria para uso residencial e comercial leve.",
+    unidade: "un",
+    badge: "",
+    ativo: true,
+  }),
+  normalizeProduct({
     id: "p45",
-    nome: "Botijão P45",
-    preco: 380,
-    categoria: "gás",
+    nome: "Botijao P45",
+    preco: 350,
+    categoria: "gas",
     descricao: "Alta capacidade para uso comercial.",
     unidade: "un",
     badge: "Alta capacidade",
@@ -99,7 +109,9 @@ export const productService = {
   },
 
   saveAll(items: ProdutoLoja[]) {
-    const normalized = (Array.isArray(items) ? items : []).map((item) => normalizeProduct(item));
+    const normalized = (Array.isArray(items) ? items : []).map((item) =>
+      normalizeProduct(item)
+    );
     safeWrite(STORAGE_KEY, normalized);
     return normalized;
   },

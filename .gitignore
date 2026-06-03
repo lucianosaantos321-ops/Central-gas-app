@@ -39,6 +39,11 @@ build/
 .env
 .env.*
 !.env.example
+android/keystore.properties
+android/app/google-services.json
+firebase-service-account.json
+*.jks
+*.keystore
 
 # IDE files
 .vscode/
@@ -58,4 +63,3 @@ Thumbs.db
 # Sensitive files (auto-detected)
 dist
 node_modules
-

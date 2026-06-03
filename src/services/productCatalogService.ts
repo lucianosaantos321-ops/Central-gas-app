@@ -1,4 +1,9 @@
 import type { ProdutoLoja } from "../types";
+import { queueRemoteDocumentSave } from "./remoteAppStateService";
+import {
+  getDefaultProductCatalog,
+  normalizeProductCatalog,
+} from "./productCatalogDefaults";
 
 const STORAGE_KEY = "cg_product_catalog_v1";
 
@@ -15,67 +20,41 @@ function uid() {
 }
 
 function defaultProducts(): ProdutoLoja[] {
-  const createdAt = now();
-
-  return [
-    {
-      id: "p13_gas",
-      nome: "Botijão P13",
-      preco: 120,
-      imagem: "",
-      categoria: "Gás",
-      descricao: "Recarga padrão residencial P13.",
-      unidade: "un",
-      badge: "Mais pedido",
-      ativo: true,
-      createdAt,
-      updatedAt: createdAt,
-    },
-    {
-      id: "p20_gas",
-      nome: "Botijão P20",
-      preco: 195,
-      imagem: "",
-      categoria: "Gás",
-      descricao: "Modelo maior para uso específico.",
-      unidade: "un",
-      badge: "",
-      ativo: false,
-      createdAt,
-      updatedAt: createdAt,
-    },
-  ];
+  return getDefaultProductCatalog(now());
 }
 
-function safeRead(): ProdutoLoja[] {
+function safeRead() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return defaultProducts();
+    if (!raw) {
+      const seeded = defaultProducts();
+      return {
+        items: seeded,
+        changed: true,
+        hasStoredValue: false,
+      };
+    }
 
     const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return defaultProducts();
-
-    return parsed.map((item: any) => ({
-      id: String(item?.id || uid()),
-      nome: String(item?.nome || "Produto"),
-      preco: Number(item?.preco ?? 0),
-      imagem: item?.imagem ? String(item.imagem) : "",
-      categoria: item?.categoria ? String(item.categoria) : "",
-      descricao: item?.descricao ? String(item.descricao) : "",
-      unidade: item?.unidade ? String(item.unidade) : "un",
-      badge: item?.badge ? String(item.badge) : "",
-      ativo: Boolean(item?.ativo),
-      createdAt: String(item?.createdAt || now()),
-      updatedAt: String(item?.updatedAt || now()),
-    }));
+    const items = normalizeProductCatalog(parsed);
+    return {
+      items,
+      changed: JSON.stringify(parsed) !== JSON.stringify(items),
+      hasStoredValue: true,
+    };
   } catch {
-    return defaultProducts();
+    const seeded = defaultProducts();
+    return {
+      items: seeded,
+      changed: true,
+      hasStoredValue: false,
+    };
   }
 }
 
 function safeWrite(items: ProdutoLoja[]) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(normalizeProductCatalog(items)));
   } catch {
     // ignore
   }
@@ -83,16 +62,21 @@ function safeWrite(items: ProdutoLoja[]) {
 
 export const productCatalogService = {
   getAll(): ProdutoLoja[] {
-    const items = safeRead();
-    if (!items.length) {
+    const { items, changed, hasStoredValue } = safeRead();
+
+    if (!hasStoredValue) {
       const seeded = defaultProducts();
       safeWrite(seeded);
+      queueRemoteDocumentSave("product_catalog", seeded);
       return seeded;
     }
-    return items.sort(
-      (a, b) =>
-        new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
-    );
+
+    if (changed) {
+      safeWrite(items);
+      queueRemoteDocumentSave("product_catalog", items);
+    }
+
+    return items;
   },
 
   getActive(): ProdutoLoja[] {
@@ -111,6 +95,8 @@ export const productCatalogService = {
     descricao?: string | null;
     unidade?: string | null;
     badge?: string | null;
+    destaque?: boolean;
+    ordem?: number | null;
     ativo?: boolean;
   }) {
     const items = this.getAll();
@@ -125,13 +111,20 @@ export const productCatalogService = {
       descricao: input.descricao?.trim() || "",
       unidade: input.unidade?.trim() || "un",
       badge: input.badge?.trim() || "",
+      destaque: Boolean(input.destaque),
+      ordem:
+        input.ordem == null || !Number.isFinite(Number(input.ordem))
+          ? items.length * 10 + 100
+          : Number(input.ordem),
       ativo: input.ativo ?? true,
       createdAt,
       updatedAt: createdAt,
     };
 
-    safeWrite([next, ...items]);
-    return next;
+    const updated = normalizeProductCatalog([next, ...items]);
+    safeWrite(updated);
+    queueRemoteDocumentSave("product_catalog", updated);
+    return updated.find((item) => item.id === next.id) ?? next;
   },
 
   update(
@@ -147,17 +140,30 @@ export const productCatalogService = {
         ...patch,
         preco:
           patch.preco !== undefined ? Number(patch.preco || 0) : item.preco,
+        ordem:
+          patch.ordem !== undefined
+            ? Number.isFinite(Number(patch.ordem))
+              ? Number(patch.ordem)
+              : item.ordem ?? null
+            : item.ordem ?? null,
+        destaque:
+          patch.destaque !== undefined ? Boolean(patch.destaque) : Boolean(item.destaque),
         updatedAt: now(),
       };
     });
 
-    safeWrite(updated);
-    return updated.find((item) => item.id === id) ?? null;
+    const normalized = normalizeProductCatalog(updated);
+    safeWrite(normalized);
+    queueRemoteDocumentSave("product_catalog", normalized);
+    return normalized.find((item) => item.id === id) ?? null;
   },
 
   remove(id: string) {
-    const items = this.getAll().filter((item) => item.id !== id);
+    const items = normalizeProductCatalog(
+      this.getAll().filter((item) => item.id !== id)
+    );
     safeWrite(items);
+    queueRemoteDocumentSave("product_catalog", items);
     return true;
   },
 
@@ -168,9 +174,11 @@ export const productCatalogService = {
   },
 
   seedIfEmpty() {
-    const items = safeRead();
-    if (!items.length) {
-      safeWrite(defaultProducts());
+    const { hasStoredValue } = safeRead();
+    if (!hasStoredValue) {
+      const seeded = defaultProducts();
+      safeWrite(seeded);
+      queueRemoteDocumentSave("product_catalog", seeded);
     }
   },
 };

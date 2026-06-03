@@ -1,4 +1,5 @@
 import React from "react";
+import { appLogger } from "../services/appLogger";
 
 type Props = {
   children: React.ReactNode;
@@ -26,7 +27,9 @@ export default class ErrorBoundary extends React.Component<Props, State> {
   }
 
   componentDidCatch(error: any, info: any) {
-    console.error("ErrorBoundary capturou um erro:", error, info);
+    appLogger.error("ui", "error_boundary_caught", error, {
+      componentStack: info?.componentStack ?? null,
+    });
   }
 
   reloadPage = () => {
@@ -44,6 +47,10 @@ export default class ErrorBoundary extends React.Component<Props, State> {
       // ignore
     }
     window.location.href = "/entregador";
+  };
+
+  goAdmin = () => {
+    window.location.href = "/admin/login";
   };
 
   render() {
@@ -104,6 +111,14 @@ export default class ErrorBoundary extends React.Component<Props, State> {
               style={btnPrimary}
             >
               Recarregar
+            </button>
+
+            <button
+              onClick={this.goAdmin}
+              type="button"
+              style={btnGhost}
+            >
+              Ir ADM
             </button>
 
             <button

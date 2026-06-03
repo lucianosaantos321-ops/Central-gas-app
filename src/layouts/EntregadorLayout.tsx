@@ -1,16 +1,36 @@
-import type { ReactNode, CSSProperties } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import { Link, useLocation } from "react-router-dom";
-import { clearEntregadorMode } from "../utils/appMode";
+import { clearDelivererAccessSession } from "../services/delivererAccessService";
+import { appLogger } from "../services/appLogger";
+import { hydrateDelivererFinanceState } from "../services/remoteFinanceStateService";
+import { useAuthStore } from "../store/useAuthStore";
+import { clearEntregadorMode, getCachedNativeAppId } from "../utils/appMode";
 
-const SAFE_TOP = "max(env(safe-area-inset-top), 8px)";
-const SAFE_BOTTOM = "max(env(safe-area-inset-bottom), 8px)";
-const NAV_HEIGHT = 62;
+const SHELL_MAX_WIDTH = 760;
+const SAFE_TOP = "max(var(--app-safe-top), 24px)";
+const SAFE_LEFT = "var(--app-safe-left)";
+const SAFE_RIGHT = "var(--app-safe-right)";
+const SHELL_GUTTER = 12;
+const TOP_OFFSET = 8;
+const HEADER_GAP = 16;
+const NAV_GAP = 18;
+const HEADER_FALLBACK_HEIGHT = 80;
+const NAV_FALLBACK_HEIGHT = 84;
+const NAV_MIN_HEIGHT = 62;
+const NAV_BOTTOM_PADDING = "10px";
 
 function NavIcon({
   name,
   active,
 }: {
-  name: "home" | "history" | "wallet" | "user";
+  name: "home" | "calendar" | "history" | "wallet" | "user";
   active: boolean;
 }) {
   const color = active ? "#FFFFFF" : "rgba(255,255,255,0.76)";
@@ -55,6 +75,15 @@ function NavIcon({
         </svg>
       );
 
+    case "calendar":
+      return (
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none">
+          <path d="M7 3v3M17 3v3" stroke={color} strokeWidth="2" strokeLinecap="round" />
+          <path d="M4 9h16" stroke={color} strokeWidth="2" strokeLinecap="round" />
+          <rect x="4" y="5" width="16" height="15" rx="2" stroke={color} strokeWidth="2" />
+        </svg>
+      );
+
     case "wallet":
       return (
         <svg width="19" height="19" viewBox="0 0 24 24" fill="none">
@@ -71,7 +100,12 @@ function NavIcon({
     case "user":
       return (
         <svg width="19" height="19" viewBox="0 0 24 24" fill="none">
-          <path d="M20 21a8 8 0 1 0-16 0" stroke={color} strokeWidth="2" strokeLinecap="round" />
+          <path
+            d="M20 21a8 8 0 1 0-16 0"
+            stroke={color}
+            strokeWidth="2"
+            strokeLinecap="round"
+          />
           <path
             d="M12 13a4 4 0 1 0-4-4 4 4 0 0 0 4 4Z"
             stroke={color}
@@ -115,14 +149,18 @@ function NavItem(props: {
     >
       <div
         style={{
-          width: 38,
-          height: 28,
+          width: 40,
+          height: 30,
           borderRadius: 999,
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
-          background: active ? "linear-gradient(90deg,#F59E0B,#E44F2A)" : "transparent",
-          border: active ? "1px solid rgba(228,79,42,0.18)" : "1px solid transparent",
+          background: active
+            ? "linear-gradient(90deg,#F59E0B,#E44F2A)"
+            : "transparent",
+          border: active
+            ? "1px solid rgba(228,79,42,0.18)"
+            : "1px solid transparent",
           boxShadow: active ? "0 8px 18px rgba(228,79,42,0.18)" : "none",
         }}
       >
@@ -146,65 +184,153 @@ function NavItem(props: {
 export default function EntregadorLayout(props: { children: ReactNode }) {
   const { children } = props;
   const location = useLocation();
+  const signOut = useAuthStore((s) => s.signOut);
+  const headerRef = useRef<HTMLElement | null>(null);
+  const navRef = useRef<HTMLElement | null>(null);
+  const [headerHeight, setHeaderHeight] = useState(HEADER_FALLBACK_HEIGHT);
+  const [navHeight, setNavHeight] = useState(NAV_FALLBACK_HEIGHT);
 
   const homeActive =
     isActive(location.pathname, "/entregador") &&
     !isActive(location.pathname, "/entregador/pedidos") &&
+    !isActive(location.pathname, "/entregador/agenda") &&
     !isActive(location.pathname, "/entregador/historico") &&
     !isActive(location.pathname, "/entregador/ganhos") &&
     !isActive(location.pathname, "/entregador/conta");
 
-  function sairModoEntregador() {
+  async function sairModoEntregador() {
+    clearDelivererAccessSession();
+    try {
+      await signOut();
+    } catch {
+      // ignore logout race here and continue local cleanup
+    }
+
+    const nativeAppId = getCachedNativeAppId();
+    if (nativeAppId.includes(".entregador")) {
+      window.location.href = "/entregador";
+      return;
+    }
+
     clearEntregadorMode();
     window.location.href = "/";
   }
 
+  useEffect(() => {
+    void hydrateDelivererFinanceState().catch((error) => {
+      appLogger.error("deliverer_layout", "hydrate_finance_failed", error);
+    });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const measure = () => {
+      const nextHeader = Math.ceil(
+        headerRef.current?.getBoundingClientRect().height ?? HEADER_FALLBACK_HEIGHT
+      );
+      const nextNav = Math.ceil(
+        navRef.current?.getBoundingClientRect().height ?? NAV_FALLBACK_HEIGHT
+      );
+
+      setHeaderHeight((current) => (current === nextHeader ? current : nextHeader));
+      setNavHeight((current) => (current === nextNav ? current : nextNav));
+    };
+
+    measure();
+
+    const resizeObserver =
+      typeof ResizeObserver !== "undefined" ? new ResizeObserver(measure) : null;
+
+    if (headerRef.current) resizeObserver?.observe(headerRef.current);
+    if (navRef.current) resizeObserver?.observe(navRef.current);
+
+    const viewport = window.visualViewport;
+    window.addEventListener("resize", measure);
+    viewport?.addEventListener("resize", measure);
+
+    return () => {
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", measure);
+      viewport?.removeEventListener("resize", measure);
+    };
+  }, []);
+
   return (
     <div style={page}>
-      <div style={shell}>
-        <header style={header}>
-          <div style={{ minWidth: 0 }}>
-            <div style={title}>Central Gás • Entregador</div>
-            <div style={subtitle}>Operação e fila de entregas</div>
+      <header ref={headerRef} style={headerWrap}>
+        <div style={headerShell}>
+          <div style={headerCard}>
+            <div style={{ minWidth: 0 }}>
+              <div style={title}>Central Gás | Entregador</div>
+              <div style={subtitle}>Operação e fila de entregas</div>
+            </div>
+
+            <button onClick={sairModoEntregador} type="button" style={exitBtn}>
+              Sair
+            </button>
           </div>
+        </div>
+      </header>
 
-          <button onClick={sairModoEntregador} type="button" style={exitBtn}>
-            Sair
-          </button>
-        </header>
+      <main
+        style={{
+          ...content,
+          paddingTop: headerHeight + HEADER_GAP,
+          paddingBottom: navHeight + NAV_GAP,
+        }}
+      >
+        <div style={contentShell}>{children}</div>
+      </main>
 
-        <main style={content}>{children}</main>
-      </div>
+      <nav ref={navRef} style={navWrap}>
+        <div style={navShell}>
+          <div style={bottomNavCard}>
+            <div style={bottomNavInner}>
+              <NavItem
+                to="/entregador"
+                label="Pedidos"
+                active={homeActive}
+                icon={<NavIcon name="home" active={homeActive} />}
+              />
 
-      <nav style={bottomNav}>
-        <div style={bottomNavInner}>
-          <NavItem
-            to="/entregador"
-            label="Início"
-            active={homeActive}
-            icon={<NavIcon name="home" active={homeActive} />}
-          />
+              <NavItem
+                to="/entregador/agenda"
+                label="Agenda"
+                active={isActive(location.pathname, "/entregador/agenda")}
+                icon={
+                  <NavIcon
+                    name="calendar"
+                    active={isActive(location.pathname, "/entregador/agenda")}
+                  />
+                }
+              />
 
-          <NavItem
-            to="/entregador/historico"
-            label="Histórico"
-            active={isActive(location.pathname, "/entregador/historico") || isActive(location.pathname, "/entregador/pedidos")}
-            icon={<NavIcon name="history" active={isActive(location.pathname, "/entregador/historico") || isActive(location.pathname, "/entregador/pedidos")} />}
-          />
+              <NavItem
+                to="/entregador/historico"
+                label="Histórico"
+                active={isActive(location.pathname, "/entregador/historico")}
+                icon={
+                  <NavIcon
+                    name="history"
+                    active={isActive(location.pathname, "/entregador/historico")}
+                  />
+                }
+              />
 
-          <NavItem
-            to="/entregador/ganhos"
-            label="Ganhos"
-            active={isActive(location.pathname, "/entregador/ganhos")}
-            icon={<NavIcon name="wallet" active={isActive(location.pathname, "/entregador/ganhos")} />}
-          />
-
-          <NavItem
-            to="/entregador/conta"
-            label="Conta"
-            active={isActive(location.pathname, "/entregador/conta")}
-            icon={<NavIcon name="user" active={isActive(location.pathname, "/entregador/conta")} />}
-          />
+              <NavItem
+                to="/entregador/conta"
+                label="Conta"
+                active={isActive(location.pathname, "/entregador/conta")}
+                icon={
+                  <NavIcon
+                    name="user"
+                    active={isActive(location.pathname, "/entregador/conta")}
+                  />
+                }
+              />
+            </div>
+          </div>
         </div>
       </nav>
     </div>
@@ -212,35 +338,48 @@ export default function EntregadorLayout(props: { children: ReactNode }) {
 }
 
 const page: CSSProperties = {
-  minHeight: "100vh",
+  minHeight: "100dvh",
   background: "#F6F7FB",
+  boxSizing: "border-box",
 };
 
-const shell: CSSProperties = {
+const headerWrap: CSSProperties = {
+  position: "fixed",
+  top: 0,
+  left: 0,
+  right: 0,
+  zIndex: 9998,
+  paddingTop: SAFE_TOP,
+  paddingLeft: SAFE_LEFT,
+  paddingRight: SAFE_RIGHT,
+  background: "#FFFFFF",
+  borderBottom: "1px solid rgba(15,23,42,0.08)",
+  boxSizing: "border-box",
+  pointerEvents: "none",
+};
+
+const headerShell: CSSProperties = {
   width: "100%",
-  maxWidth: "100%",
+  maxWidth: SHELL_MAX_WIDTH,
   margin: "0 auto",
   boxSizing: "border-box",
-  paddingTop: SAFE_TOP,
-  paddingRight: 12,
-  paddingBottom: `calc(${SAFE_BOTTOM} + ${NAV_HEIGHT}px + 6px)`,
-  paddingLeft: 12,
+  paddingTop: TOP_OFFSET,
+  paddingLeft: SHELL_GUTTER,
+  paddingRight: SHELL_GUTTER,
+  minWidth: 0,
 };
 
-const header: CSSProperties = {
-  position: "sticky",
-  top: `calc(${SAFE_TOP} - 2px)`,
-  zIndex: 20,
-  background: "rgba(246,247,251,0.92)",
-  backdropFilter: "blur(10px)",
-  border: "1px solid rgba(0,0,0,0.06)",
-  borderRadius: 18,
-  padding: "10px 12px",
+const headerCard: CSSProperties = {
+  background: "#FFFFFF",
+  border: "none",
+  borderRadius: 0,
+  padding: "10px 0 12px",
   display: "flex",
   alignItems: "center",
   justifyContent: "space-between",
   gap: 12,
-  boxShadow: "0 10px 26px rgba(0,0,0,0.04)",
+  boxShadow: "none",
+  pointerEvents: "auto",
 };
 
 const title: CSSProperties = {
@@ -262,8 +401,8 @@ const subtitle: CSSProperties = {
 };
 
 const exitBtn: CSSProperties = {
-  height: 36,
-  padding: "0 12px",
+  height: 40,
+  padding: "0 14px",
   borderRadius: 14,
   border: "1px solid rgba(0,0,0,0.12)",
   background: "#fff",
@@ -273,29 +412,63 @@ const exitBtn: CSSProperties = {
 };
 
 const content: CSSProperties = {
-  paddingTop: 12,
+  width: "100%",
+  paddingLeft: SAFE_LEFT,
+  paddingRight: SAFE_RIGHT,
+  boxSizing: "border-box",
+  minWidth: 0,
 };
 
-const bottomNav: CSSProperties = {
+const contentShell: CSSProperties = {
+  width: "100%",
+  maxWidth: SHELL_MAX_WIDTH,
+  margin: "0 auto",
+  boxSizing: "border-box",
+  paddingLeft: SHELL_GUTTER,
+  paddingRight: SHELL_GUTTER,
+  minWidth: 0,
+};
+
+const navWrap: CSSProperties = {
   position: "fixed",
   bottom: 0,
   left: 0,
   right: 0,
-  background: "rgba(15,23,42,0.96)",
-  backdropFilter: "blur(10px)",
-  borderTop: "1px solid rgba(255,255,255,0.08)",
-  minHeight: `calc(${NAV_HEIGHT}px + ${SAFE_BOTTOM})`,
-  paddingBottom: SAFE_BOTTOM,
-  display: "flex",
-  alignItems: "center",
   zIndex: 9999,
-  boxShadow: "0 -8px 24px rgba(15,23,42,0.18)",
+  paddingBottom: 0,
+  paddingLeft: SAFE_LEFT,
+  paddingRight: SAFE_RIGHT,
+  background: "#0F172A",
+  borderTop: "1px solid rgba(255,255,255,0.08)",
+  boxSizing: "border-box",
+  pointerEvents: "none",
+};
+
+const navShell: CSSProperties = {
+  width: "100%",
+  maxWidth: SHELL_MAX_WIDTH,
+  margin: "0 auto",
+  paddingLeft: 0,
+  paddingRight: 0,
+  boxSizing: "border-box",
+};
+
+const bottomNavCard: CSSProperties = {
+  minHeight: `calc(${NAV_MIN_HEIGHT}px + ${NAV_BOTTOM_PADDING})`,
+  padding: `8px 12px calc(${NAV_BOTTOM_PADDING} + 2px)`,
+  borderRadius: 0,
+  background: "#0F172A",
+  border: "none",
+  boxShadow: "none",
+  pointerEvents: "auto",
 };
 
 const bottomNavInner: CSSProperties = {
   width: "100%",
   display: "flex",
   alignItems: "center",
-  padding: "6px 6px",
+  justifyContent: "space-between",
+  gap: 2,
+  padding: "2px 2px 0",
   boxSizing: "border-box",
 };

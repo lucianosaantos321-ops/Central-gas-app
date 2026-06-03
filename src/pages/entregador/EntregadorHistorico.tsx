@@ -3,127 +3,71 @@ import PageHeader from "../../components/PageHeader";
 import { useMemo, useState, type CSSProperties } from "react";
 import { useNavigate } from "react-router-dom";
 import { usePedidoStore } from "../../store/usePedidoStore";
-import { useEntregadorStore } from "../../store/useEntregadorStore";
-import { money, safeText, statusLabel, getTime } from "../../utils/delivererHelpers";
+import { safeText, statusLabel, getTime, money } from "../../utils/delivererHelpers";
+import { useDebouncedValue } from "../../hooks/useDebouncedValue";
+import { useEffectiveEntregadorId } from "../../hooks/useEffectiveEntregadorId";
+import { sectionCardStyle, ui } from "../../styles/ui";
+import { financeService } from "../../services/financeService";
 
-type HistoryFilter = "todos" | "entregues" | "cancelados";
+type HistoryFilter = "entregues" | "cancelados";
 
-function formatDateInput(date: Date) {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  const d = String(date.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
+function getPedidoDate(pedido: any) {
+  return new Date(pedido?.updatedAt ?? pedido?.createdAt ?? 0);
 }
 
-function escapeCsv(value: unknown) {
-  const text = String(value ?? "");
-  const escaped = text.replace(/"/g, '""');
-  return `"${escaped}"`;
+function getSelectValue(value: string) {
+  return value || "all";
 }
 
-function exportRowsToCsv(filename: string, rows: Record<string, unknown>[]) {
-  if (!Array.isArray(rows) || rows.length === 0) {
-    alert("Não há dados para exportar.");
-    return;
-  }
-
-  const headers = Object.keys(rows[0]);
-  const csv = [
-    headers.map(escapeCsv).join(","),
-    ...rows.map((row) => headers.map((key) => escapeCsv(row[key])).join(",")),
-  ].join("\n");
-
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename.endsWith(".csv") ? filename : `${filename}.csv`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-
-  URL.revokeObjectURL(url);
-}
-
-function badgeStyle(status: string): CSSProperties {
-  if (status === "entregue") {
-    return {
-      background: "rgba(22,163,74,0.10)",
-      color: "#166534",
-      border: "1px solid rgba(22,163,74,0.16)",
-    };
-  }
-
-  if (status === "cancelado") {
-    return {
-      background: "rgba(185,28,28,0.08)",
-      color: "#7F1D1D",
-      border: "1px solid rgba(185,28,28,0.14)",
-    };
-  }
-
-  return {
-    background: "#F1F5F9",
-    color: "#111827",
-    border: "1px solid rgba(15,23,42,0.06)",
-  };
+function parseSelectValue(value: string) {
+  return value === "all" ? "" : value;
 }
 
 export default function EntregadorHistorico() {
   const navigate = useNavigate();
-
   const pedidos = usePedidoStore((s) => s.pedidos);
-  const entregadorId = useEntregadorStore((s) => s.entregadorId);
-
-  const today = useMemo(() => new Date(), []);
-  const defaultStart = useMemo(() => {
-    const d = new Date();
-    d.setDate(d.getDate() - 60);
-    return formatDateInput(d);
-  }, []);
-  const defaultEnd = useMemo(() => formatDateInput(today), [today]);
-
-  const [filtro, setFiltro] = useState<HistoryFilter>("todos");
+  const entregadorId = useEffectiveEntregadorId();
+  const [filtro, setFiltro] = useState<HistoryFilter>("entregues");
   const [busca, setBusca] = useState("");
-  const [startDate, setStartDate] = useState(defaultStart);
-  const [endDate, setEndDate] = useState(defaultEnd);
+  const buscaDebounced = useDebouncedValue(busca, 220);
+  const [anoFiltro, setAnoFiltro] = useState("");
+  const [mesFiltro, setMesFiltro] = useState("");
+  const [diaFiltro, setDiaFiltro] = useState("");
 
-  const allHistory = useMemo(() => {
-    const base = Array.isArray(pedidos) ? pedidos : [];
+  const years = useMemo(() => {
+    const values = new Set<number>();
+    (Array.isArray(pedidos) ? pedidos : []).forEach((pedido: any) => {
+      const date = getPedidoDate(pedido);
+      if (!Number.isNaN(date.getTime())) values.add(date.getFullYear());
+    });
+    return Array.from(values).sort((a, b) => b - a);
+  }, [pedidos]);
 
-    return [...base]
+  const rows = useMemo(() => {
+    const base = (Array.isArray(pedidos) ? pedidos : [])
       .filter(
         (p: any) =>
           String(p?.entregadorId || "") === entregadorId &&
           (p?.status === "entregue" || p?.status === "cancelado")
       )
       .sort((a: any, b: any) => getTime(b) - getTime(a));
-  }, [pedidos, entregadorId]);
 
-  const rows = useMemo(() => {
-    const q = busca.trim().toLowerCase();
-    const startMs = startDate ? new Date(`${startDate}T00:00:00`).getTime() : 0;
-    const endMs = endDate ? new Date(`${endDate}T23:59:59`).getTime() : Number.MAX_SAFE_INTEGER;
+    const q = buscaDebounced.trim().toLowerCase();
 
-    return allHistory.filter((p: any) => {
-      const ts = new Date(p?.updatedAt ?? p?.createdAt ?? 0).getTime();
-
-      if (Number.isFinite(startMs) && ts < startMs) return false;
-      if (Number.isFinite(endMs) && ts > endMs) return false;
-
+    return base.filter((p: any) => {
       if (filtro === "entregues" && p?.status !== "entregue") return false;
       if (filtro === "cancelados" && p?.status !== "cancelado") return false;
+      const date = getPedidoDate(p);
 
+      if (anoFiltro && String(date.getFullYear()) !== anoFiltro) return false;
+      if (mesFiltro && String(date.getMonth() + 1).padStart(2, "0") !== mesFiltro) return false;
+      if (diaFiltro && String(date.getDate()).padStart(2, "0") !== diaFiltro) return false;
       if (!q) return true;
 
       const haystack = [
         p?.id,
         p?.clienteNome,
         p?.clienteTelefone,
-        p?.status,
-        p?.motivoCancelamento,
-        p?.observacaoCancelamento,
         p?.enderecoSnapshot?.bairro,
         p?.enderecoSnapshot?.neighborhood,
         p?.enderecoSnapshot?.cidade,
@@ -135,231 +79,145 @@ export default function EntregadorHistorico() {
 
       return haystack.includes(q);
     });
-  }, [allHistory, filtro, busca, startDate, endDate]);
+  }, [pedidos, entregadorId, filtro, buscaDebounced, anoFiltro, mesFiltro, diaFiltro]);
 
-  const summary = useMemo(() => {
-    const entregues = rows.filter((p: any) => p?.status === "entregue");
-    const cancelados = rows.filter((p: any) => p?.status === "cancelado");
+  const resumo = useMemo(() => {
+    const hoje = rows.filter((p: any) => {
+      const d = getPedidoDate(p);
+      const now = new Date();
+      return (
+        d.getDate() === now.getDate() &&
+        d.getMonth() === now.getMonth() &&
+        d.getFullYear() === now.getFullYear()
+      );
+    });
+
+    const totalVendido = rows
+      .filter((p: any) => p?.status === "entregue")
+      .reduce((acc: number, p: any) => acc + Number(p?.total ?? 0), 0);
 
     return {
-      total: rows.length,
-      entregues: entregues.length,
-      cancelados: cancelados.length,
-      ganhoBruto: entregues.length * 7,
+      ofertas: rows.filter((p: any) => p?.status === "cancelado").length,
+      filaAtiva: rows.filter((p: any) => p?.status === "entregue").length,
+      entreguesHoje: hoje.filter((p: any) => p?.status === "entregue").length,
+      comissaoApp: financeService.getDelivererState(entregadorId).saldoDevedor,
+      totalVendido,
     };
-  }, [rows]);
-
-  function exportCsv() {
-    exportRowsToCsv(
-      `historico_entregador_${entregadorId}.csv`,
-      rows.map((p: any) => ({
-        pedido_id: String(p?.id ?? ""),
-        status: String(p?.status ?? ""),
-        cliente_nome: String(p?.clienteNome ?? ""),
-        cliente_telefone: String(p?.clienteTelefone ?? ""),
-        total_pedido: Number(p?.total ?? 0),
-        taxa_entrega: Number(p?.taxaEntrega ?? 0),
-        data: String(p?.updatedAt ?? p?.createdAt ?? ""),
-        bairro: String(
-          p?.enderecoSnapshot?.bairro ?? p?.enderecoSnapshot?.neighborhood ?? ""
-        ),
-        cidade: String(
-          p?.enderecoSnapshot?.cidade ?? p?.enderecoSnapshot?.city ?? ""
-        ),
-        motivo_cancelamento: String(p?.motivoCancelamento ?? ""),
-        observacao_cancelamento: String(p?.observacaoCancelamento ?? ""),
-      }))
-    );
-  }
+  }, [rows, entregadorId]);
 
   return (
     <EntregadorLayout>
       <div style={{ display: "grid", gap: 14 }}>
-        <PageHeader
-          title="Histórico"
-          subtitle="Entregas concluídas, cancelamentos e exportação"
-        />
+        <PageHeader title="Histórico" subtitle="Entregas concluídas e cancelamentos" />
 
-        <div style={heroCard}>
-          <div style={heroTop}>
-            <div>
-              <div style={heroMini}>Período analisado</div>
-              <div style={heroTitle}>{summary.total} registro(s)</div>
-              <div style={heroSub}>Consulta padrão dos últimos 60 dias</div>
+        <div style={summaryCard}>
+          <div style={summaryTitle}>Resumo rápido</div>
+          <div style={summaryGrid}>
+            <div style={summaryMini}>
+              <div style={summaryLabel}>Entregues</div>
+              <div style={summaryValue}>{resumo.filaAtiva}</div>
             </div>
-
-            <button onClick={exportCsv} type="button" style={heroAction}>
-              Exportar CSV
-            </button>
-          </div>
-
-          <div style={statsGrid}>
-            <div style={statCardDark}>
-              <div style={statLabel}>Entregues</div>
-              <div style={statValue}>{summary.entregues}</div>
+            <div style={summaryMini}>
+              <div style={summaryLabel}>Cancelados</div>
+              <div style={summaryValue}>{resumo.ofertas}</div>
             </div>
-
-            <div style={statCardDark}>
-              <div style={statLabel}>Cancelados</div>
-              <div style={statValue}>{summary.cancelados}</div>
+            <div style={summaryMini}>
+              <div style={summaryLabel}>Entregues hoje</div>
+              <div style={summaryValue}>{resumo.entreguesHoje}</div>
             </div>
-
-            <div style={statCardDark}>
-              <div style={statLabel}>Ganho bruto</div>
-              <div style={statValueMoney}>{money(summary.ganhoBruto)}</div>
+            <div style={summaryMini}>
+              <div style={summaryLabel}>Comissão do app</div>
+              <div style={summaryMoney}>{money(resumo.comissaoApp)}</div>
             </div>
-
-            <div style={statCardDark}>
-              <div style={statLabel}>Filtro ativo</div>
-              <div style={statValueSmall}>
-                {filtro === "todos"
-                  ? "Todos"
-                  : filtro === "entregues"
-                  ? "Entregues"
-                  : "Cancelados"}
-              </div>
+            <div style={summaryMiniWide}>
+              <div style={summaryLabel}>Total vendido</div>
+              <div style={summaryMoney}>{money(resumo.totalVendido)}</div>
             </div>
           </div>
         </div>
 
-        <div style={toolbarCard}>
-          <div style={chipRow}>
-            <button
-              onClick={() => setFiltro("todos")}
-              type="button"
-              style={{
-                ...chipBtn,
-                ...(filtro === "todos" ? chipBtnActive : null),
-              }}
-            >
-              Todos
-            </button>
-
-            <button
-              onClick={() => setFiltro("entregues")}
-              type="button"
-              style={{
-                ...chipBtn,
-                ...(filtro === "entregues" ? chipBtnActive : null),
-              }}
-            >
-              Entregues
-            </button>
-
-            <button
-              onClick={() => setFiltro("cancelados")}
-              type="button"
-              style={{
-                ...chipBtn,
-                ...(filtro === "cancelados" ? chipBtnActive : null),
-              }}
-            >
-              Cancelados
-            </button>
+        <div style={heroCard}>
+          <div style={heroTitle}>Histórico de entregas</div>
+          <div style={tabsRow}>
+            <button onClick={() => setFiltro("entregues")} type="button" style={{ ...tabBtn, ...(filtro === "entregues" ? tabBtnActive : null) }}>Concluídos</button>
+            <button onClick={() => setFiltro("cancelados")} type="button" style={{ ...tabBtn, ...(filtro === "cancelados" ? tabBtnActive : null) }}>Cancelados</button>
           </div>
-
-          <div style={toolbarGrid}>
-            <input
-              value={busca}
-              onChange={(e) => setBusca(e.target.value)}
-              placeholder="Buscar por pedido, cliente, bairro..."
-              style={searchInput}
-            />
-
-            <div style={dateGrid}>
-              <label style={fieldWrap}>
-                <span style={fieldLabel}>De</span>
-                <input
-                  type="date"
-                  value={startDate}
-                  onChange={(e) => setStartDate(e.target.value)}
-                  style={fieldInput}
-                />
-              </label>
-
-              <label style={fieldWrap}>
-                <span style={fieldLabel}>Até</span>
-                <input
-                  type="date"
-                  value={endDate}
-                  onChange={(e) => setEndDate(e.target.value)}
-                  style={fieldInput}
-                />
-              </label>
-            </div>
+          <div style={filtersGrid}>
+            <select value={getSelectValue(anoFiltro)} onChange={(e) => setAnoFiltro(parseSelectValue(e.target.value))} style={filterSelect}>
+              <option value="all">Ano</option>
+              {years.map((year) => (
+                <option key={year} value={String(year)}>
+                  {year}
+                </option>
+              ))}
+            </select>
+            <select value={getSelectValue(mesFiltro)} onChange={(e) => setMesFiltro(parseSelectValue(e.target.value))} style={filterSelect}>
+              <option value="all">Mês</option>
+              {Array.from({ length: 12 }, (_, index) => {
+                const value = String(index + 1).padStart(2, "0");
+                return (
+                  <option key={value} value={value}>
+                    {value}
+                  </option>
+                );
+              })}
+            </select>
+            <select value={getSelectValue(diaFiltro)} onChange={(e) => setDiaFiltro(parseSelectValue(e.target.value))} style={filterSelect}>
+              <option value="all">Dia</option>
+              {Array.from({ length: 31 }, (_, index) => {
+                const value = String(index + 1).padStart(2, "0");
+                return (
+                  <option key={value} value={value}>
+                    {value}
+                  </option>
+                );
+              })}
+            </select>
           </div>
+          <input value={busca} onChange={(e) => setBusca(e.target.value)} placeholder="Filtre por ID ou endereço" style={searchInput} />
         </div>
 
         <div style={sectionCard}>
           <div style={sectionHeader}>
-            <div style={sectionTitle}>Registros</div>
-            <span style={countPill}>{rows.length}</span>
+            <div style={sectionTitle}>
+              {rows.length} {filtro === "entregues" ? "entrega(s)" : "registro(s)"}
+            </div>
           </div>
 
           {rows.length === 0 ? (
-            <div style={emptyCard}>
-              <div style={emptyTitle}>Nenhum registro encontrado</div>
-              <div style={emptyText}>
-                Ajuste o período ou o filtro para localizar entregas e cancelamentos.
-              </div>
-            </div>
+            <div style={emptyText}>Nenhum registro encontrado.</div>
           ) : (
-            <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
-              {rows.map((p: any) => {
+            <div style={{ marginTop: 12, display: "grid", gap: 12 }}>
+              {rows.map((p: any, index: number) => {
                 const bairro =
-                  safeText(
-                    p?.enderecoSnapshot?.bairro ?? p?.enderecoSnapshot?.neighborhood
-                  ) ||
-                  safeText(
-                    p?.enderecoSnapshot?.cidade ?? p?.enderecoSnapshot?.city
-                  ) ||
+                  safeText(p?.enderecoSnapshot?.bairro ?? p?.enderecoSnapshot?.neighborhood) ||
+                  safeText(p?.enderecoSnapshot?.cidade ?? p?.enderecoSnapshot?.city) ||
                   "Sem região";
 
+                const resumoItens = Array.isArray(p?.itens)
+                  ? p.itens.map((item: any) => `${item.quantidade} ${item.nome}`).join(", ")
+                  : "Sem itens";
+
+                const horario = getPedidoDate(p).toLocaleTimeString("pt-BR", {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                });
+
                 return (
-                  <button
-                    key={p.id}
-                    onClick={() => navigate(`/entregador/pedido/${p.id}`)}
-                    type="button"
-                    style={historyCardBtn}
-                  >
-                    <div style={{ minWidth: 0, textAlign: "left" }}>
+                  <button key={p.id} onClick={() => navigate(`/entregador/pedido/${p.id}`)} type="button" style={historyCardBtn}>
+                    <div style={indexBadge}>{index + 1}</div>
+                    <div style={{ minWidth: 0, textAlign: "left", flex: 1 }}>
                       <div style={cardTop}>
-                        <div style={cardTitle}>Pedido nº {String(p.id).slice(0, 6)}</div>
-
-                        <span
-                          style={{
-                            ...statusBadge,
-                            ...badgeStyle(String(p?.status ?? "")),
-                          }}
-                        >
-                          {statusLabel(p.status)}
-                        </span>
+                        <div style={cardTitle}>Pedido #{String(p.id).slice(0, 6)}</div>
+                        <span style={{ ...statusBadge, ...(p?.status === "entregue" ? deliveredBadge : cancelledBadge) }}>{statusLabel(p.status)}</span>
                       </div>
-
-                      <div style={cardMeta}>
-                        {safeText(p?.clienteNome) || "Cliente"} • {bairro}
-                      </div>
-
-                      <div style={cardDate}>
-                        {new Date(p.updatedAt ?? p.createdAt).toLocaleString("pt-BR")}
-                      </div>
-
-                      {p?.status === "cancelado" ? (
-                        <div style={cancelBox}>
-                          <strong>Motivo:</strong>{" "}
-                          {safeText(p?.motivoCancelamento) || "Sem motivo informado"}
-                          {safeText(p?.observacaoCancelamento) ? (
-                            <div style={{ marginTop: 6 }}>
-                              <strong>Obs:</strong> {safeText(p.observacaoCancelamento)}
-                            </div>
-                          ) : null}
-                        </div>
-                      ) : null}
+                      <div style={cardMeta}>{bairro}</div>
+                      <div style={cardMeta}>{resumoItens}</div>
+                      <div style={timeMeta}>Horário: {horario}</div>
                     </div>
-
-                    <div style={sideValueWrap}>
-                      <div style={sideValue}>{money(Number(p?.total ?? 0))}</div>
-                      <div style={sideHint}>Abrir</div>
+                    <div style={valueCol}>
+                      <div style={valueMoney}>{money(Number(p?.total ?? 0))}</div>
+                      <div style={valueHint}>Ver pedido</div>
                     </div>
                   </button>
                 );
@@ -373,293 +231,57 @@ export default function EntregadorHistorico() {
 }
 
 const heroCard: CSSProperties = {
-  background: "linear-gradient(135deg,#0F172A 0%, #111827 55%, #1F2937 100%)",
-  borderRadius: 24,
+  background: "linear-gradient(180deg,#FFF7ED 0%, #FFFFFF 100%)",
+  borderRadius: ui.radius.hero,
+  padding: 18,
+  border: "1px solid rgba(228,79,42,0.12)",
+  boxShadow: ui.shadow.orange,
+};
+const summaryCard: CSSProperties = {
+  background: "linear-gradient(135deg,#0F172A 0%, #111827 100%)",
+  borderRadius: ui.radius.section,
   padding: 16,
   color: "#fff",
-  boxShadow: "0 18px 44px rgba(0,0,0,0.20)",
+  boxShadow: ui.shadow.dark,
 };
-
-const heroTop: CSSProperties = {
-  display: "flex",
-  justifyContent: "space-between",
-  alignItems: "center",
-  gap: 12,
-  flexWrap: "wrap",
-};
-
-const heroMini: CSSProperties = {
-  fontSize: 12,
-  fontWeight: 900,
-  opacity: 0.82,
-  textTransform: "uppercase",
-};
-
-const heroTitle: CSSProperties = {
-  marginTop: 6,
-  fontSize: 26,
-  fontWeight: 950,
-};
-
-const heroSub: CSSProperties = {
-  marginTop: 6,
-  fontSize: 13,
-  opacity: 0.82,
-};
-
-const heroAction: CSSProperties = {
-  height: 44,
-  minWidth: 150,
-  borderRadius: 16,
-  border: "1px solid rgba(255,255,255,0.18)",
-  background: "rgba(255,255,255,0.10)",
-  color: "#fff",
-  fontWeight: 900,
-  cursor: "pointer",
-};
-
-const statsGrid: CSSProperties = {
-  marginTop: 14,
-  display: "grid",
-  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-  gap: 10,
-};
-
-const statCardDark: CSSProperties = {
-  background: "rgba(255,255,255,0.08)",
-  border: "1px solid rgba(255,255,255,0.10)",
-  borderRadius: 18,
-  padding: 12,
-};
-
-const statLabel: CSSProperties = {
-  fontSize: 12,
-  fontWeight: 900,
-  opacity: 0.82,
-};
-
-const statValue: CSSProperties = {
-  marginTop: 6,
-  fontSize: 22,
-  fontWeight: 950,
-};
-
-const statValueMoney: CSSProperties = {
-  marginTop: 6,
-  fontSize: 18,
-  fontWeight: 950,
-};
-
-const statValueSmall: CSSProperties = {
-  marginTop: 6,
-  fontSize: 16,
-  fontWeight: 950,
-};
-
-const toolbarCard: CSSProperties = {
-  background: "#fff",
-  borderRadius: 24,
-  padding: 16,
-  border: "1px solid rgba(0,0,0,0.08)",
-  boxShadow: "0 8px 22px rgba(0,0,0,0.05)",
-};
-
-const chipRow: CSSProperties = {
-  display: "flex",
-  gap: 8,
-  flexWrap: "wrap",
-};
-
-const chipBtn: CSSProperties = {
-  height: 40,
-  padding: "0 14px",
-  borderRadius: 999,
-  border: "1px solid rgba(0,0,0,0.10)",
-  background: "#fff",
-  color: "#111827",
-  fontWeight: 900,
-  cursor: "pointer",
-};
-
-const chipBtnActive: CSSProperties = {
-  border: "none",
-  background: "linear-gradient(90deg,#E44F2A,#F59E0B)",
-  color: "#fff",
-  boxShadow: "0 10px 22px rgba(228,79,42,0.18)",
-};
-
-const toolbarGrid: CSSProperties = {
-  marginTop: 12,
-  display: "grid",
-  gap: 12,
-};
-
-const searchInput: CSSProperties = {
-  width: "100%",
-  height: 46,
-  borderRadius: 16,
-  border: "1px solid rgba(0,0,0,0.12)",
-  background: "#fff",
-  padding: "0 14px",
-  fontWeight: 800,
-  color: "#111827",
-  outline: "none",
-};
-
-const dateGrid: CSSProperties = {
-  display: "grid",
-  gridTemplateColumns: "1fr 1fr",
-  gap: 10,
-};
-
-const fieldWrap: CSSProperties = {
-  display: "grid",
-  gap: 6,
-};
-
-const fieldLabel: CSSProperties = {
-  fontSize: 12,
-  fontWeight: 900,
-  color: "#64748B",
-};
-
-const fieldInput: CSSProperties = {
-  width: "100%",
-  height: 46,
-  borderRadius: 16,
-  border: "1px solid rgba(0,0,0,0.12)",
-  background: "#fff",
-  padding: "0 14px",
-  fontWeight: 800,
-  color: "#111827",
-  outline: "none",
-};
-
-const sectionCard: CSSProperties = {
-  background: "#fff",
-  borderRadius: 24,
-  padding: 16,
-  border: "1px solid rgba(0,0,0,0.08)",
-  boxShadow: "0 8px 22px rgba(0,0,0,0.05)",
-};
-
-const sectionHeader: CSSProperties = {
-  display: "flex",
-  justifyContent: "space-between",
-  gap: 10,
-  alignItems: "center",
-};
-
-const sectionTitle: CSSProperties = {
-  fontSize: 16,
-  fontWeight: 950,
-  color: "#111827",
-};
-
-const countPill: CSSProperties = {
-  minWidth: 30,
-  height: 30,
-  borderRadius: 999,
-  display: "grid",
-  placeItems: "center",
-  background: "#F1F5F9",
-  color: "#111827",
-  fontWeight: 950,
-  fontSize: 12,
-};
-
-const emptyCard: CSSProperties = {
-  marginTop: 12,
-  borderRadius: 18,
-  padding: 16,
-  background: "#F8FAFC",
-  border: "1px solid rgba(15,23,42,0.06)",
-};
-
-const emptyTitle: CSSProperties = {
-  fontSize: 16,
-  fontWeight: 950,
-  color: "#111827",
-};
-
-const emptyText: CSSProperties = {
-  marginTop: 6,
-  fontSize: 13,
-  color: "#64748B",
-  lineHeight: 1.5,
-};
-
+const summaryTitle: CSSProperties = { fontSize: 16, fontWeight: 950, color: "#fff" };
+const summaryGrid: CSSProperties = { marginTop: 12, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 };
+const summaryMini: CSSProperties = { borderRadius: 16, padding: 12, background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.08)" };
+const summaryMiniWide: CSSProperties = { ...summaryMini, gridColumn: "1 / -1" };
+const summaryLabel: CSSProperties = { fontSize: 12, fontWeight: 900, color: "rgba(255,255,255,0.72)" };
+const summaryValue: CSSProperties = { marginTop: 8, fontSize: 22, fontWeight: 950, color: "#fff" };
+const summaryMoney: CSSProperties = { marginTop: 8, fontSize: 18, fontWeight: 950, color: "#FDE68A" };
+const heroTitle: CSSProperties = { fontSize: 18, fontWeight: 950, color: "#111827" };
+const tabsRow: CSSProperties = { marginTop: 14, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 };
+const tabBtn: CSSProperties = { height: 42, borderRadius: 999, border: "1px solid rgba(15,23,42,0.10)", background: "#fff", fontWeight: 900, cursor: "pointer" };
+const tabBtnActive: CSSProperties = { border: "none", background: "linear-gradient(90deg,#E44F2A,#F59E0B)", color: "#fff" };
+const filtersGrid: CSSProperties = { marginTop: 12, display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10 };
+const filterSelect: CSSProperties = { width: "100%", height: 44, borderRadius: 14, border: "1px solid rgba(15,23,42,0.10)", background: "#fff", padding: "0 12px", fontWeight: 800, color: "#111827", outline: "none" };
+const searchInput: CSSProperties = { marginTop: 12, width: "100%", height: 46, borderRadius: 16, border: "1px solid rgba(0,0,0,0.12)", background: "#fff", padding: "0 14px", fontWeight: 800, color: "#111827", outline: "none" };
+const sectionCard: CSSProperties = { ...sectionCardStyle() };
+const sectionHeader: CSSProperties = { display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" };
+const sectionTitle: CSSProperties = { fontSize: 16, fontWeight: 950, color: "#111827" };
+const emptyText: CSSProperties = { marginTop: 12, color: "#475569", lineHeight: 1.55 };
 const historyCardBtn: CSSProperties = {
-  width: "100%",
-  textAlign: "left",
   display: "flex",
-  justifyContent: "space-between",
-  gap: 14,
+  gap: 12,
   alignItems: "flex-start",
+  width: "100%",
   padding: 14,
-  borderRadius: 18,
-  border: "1px solid rgba(15,23,42,0.06)",
-  background: "#F8FAFC",
+  borderRadius: 16,
+  border: "1px solid rgba(15,23,42,0.08)",
+  background: "#fff",
+  boxShadow: "0 8px 18px rgba(15,23,42,0.05)",
   cursor: "pointer",
 };
-
-const cardTop: CSSProperties = {
-  display: "flex",
-  gap: 8,
-  alignItems: "center",
-  flexWrap: "wrap",
-};
-
-const cardTitle: CSSProperties = {
-  fontSize: 15,
-  fontWeight: 950,
-  color: "#111827",
-};
-
-const cardMeta: CSSProperties = {
-  marginTop: 8,
-  fontSize: 13,
-  color: "#64748B",
-};
-
-const cardDate: CSSProperties = {
-  marginTop: 6,
-  fontSize: 12.5,
-  color: "#94A3B8",
-};
-
-const statusBadge: CSSProperties = {
-  padding: "6px 10px",
-  borderRadius: 999,
-  fontWeight: 900,
-  fontSize: 12,
-};
-
-const cancelBox: CSSProperties = {
-  marginTop: 10,
-  borderRadius: 14,
-  padding: 10,
-  background: "rgba(185,28,28,0.06)",
-  color: "#7F1D1D",
-  fontSize: 12.5,
-  lineHeight: 1.5,
-  border: "1px solid rgba(185,28,28,0.12)",
-};
-
-const sideValueWrap: CSSProperties = {
-  textAlign: "right",
-  whiteSpace: "nowrap",
-};
-
-const sideValue: CSSProperties = {
-  fontSize: 14,
-  fontWeight: 950,
-  color: "#111827",
-};
-
-const sideHint: CSSProperties = {
-  marginTop: 8,
-  fontSize: 12,
-  fontWeight: 900,
-  color: "#E44F2A",
-};
+const indexBadge: CSSProperties = { width: 34, height: 34, borderRadius: 999, background: "#F97316", color: "#fff", display: "grid", placeItems: "center", fontWeight: 950, flexShrink: 0 };
+const cardTop: CSSProperties = { display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" };
+const cardTitle: CSSProperties = { fontSize: 16, fontWeight: 950, color: "#111827" };
+const cardMeta: CSSProperties = { marginTop: 4, fontSize: 12.5, color: "#64748B", lineHeight: 1.35 };
+const timeMeta: CSSProperties = { marginTop: 8, fontSize: 13, color: "#F97316", fontWeight: 900, lineHeight: 1.4 };
+const statusBadge: CSSProperties = { padding: "6px 10px", borderRadius: 999, fontWeight: 900, fontSize: 12 };
+const deliveredBadge: CSSProperties = { background: "rgba(34,197,94,0.10)", color: "#166534", border: "1px solid rgba(34,197,94,0.16)" };
+const cancelledBadge: CSSProperties = { background: "rgba(239,68,68,0.10)", color: "#991B1B", border: "1px solid rgba(239,68,68,0.16)" };
+const valueCol: CSSProperties = { minWidth: 74, textAlign: "right" };
+const valueMoney: CSSProperties = { fontSize: 15, fontWeight: 950, color: "#E44F2A" };
+const valueHint: CSSProperties = { marginTop: 8, fontSize: 12.5, color: "#64748B", fontWeight: 700 };

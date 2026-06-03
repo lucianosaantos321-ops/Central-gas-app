@@ -2,6 +2,7 @@ import { useMemo, type CSSProperties } from "react";
 import { Link } from "react-router-dom";
 import AdminLayout from "../../layouts/AdminLayout";
 import { usePedidoStore } from "../../store/usePedidoStore";
+import { useRemoteSyncStore } from "../../store/useRemoteSyncStore";
 import { productCatalogService } from "../../services/productCatalogService";
 import { couponAdminService } from "../../services/couponAdminService";
 import { financeService } from "../../services/financeService";
@@ -9,10 +10,18 @@ import { money } from "../../utils/delivererHelpers";
 
 export default function AdminDashboard() {
   const pedidos = usePedidoStore((s) => s.pedidos);
+  const publicVersion = useRemoteSyncStore((s) => s.publicVersion);
+  const financeVersion = useRemoteSyncStore((s) => s.financeVersion);
 
-  const produtos = useMemo(() => productCatalogService.getAll(), []);
-  const couponMetrics = useMemo(() => couponAdminService.getMetrics(pedidos), [pedidos]);
-  const financialSummary = useMemo(() => financeService.getGlobalSummary(pedidos), [pedidos]);
+  const produtos = useMemo(() => productCatalogService.getAll(), [publicVersion]);
+  const couponMetrics = useMemo(
+    () => couponAdminService.getMetrics(pedidos),
+    [pedidos, publicVersion]
+  );
+  const financialSummary = useMemo(
+    () => financeService.getGlobalSummary(pedidos),
+    [pedidos, publicVersion, financeVersion]
+  );
 
   const overview = useMemo(() => {
     const all = Array.isArray(pedidos) ? pedidos : [];
@@ -89,8 +98,8 @@ export default function AdminDashboard() {
 
   return (
     <AdminLayout
-      title="Dashboard central"
-      subtitle="Leitura geral da operação, catálogo, campanhas, risco e financeiro em um único painel"
+      title="Resumo"
+      subtitle="Visao geral da operacao, produtos, campanhas, risco e financeiro."
     >
       <div style={topGrid}>
         <MetricCard label="Pedidos totais" value={String(overview.total)} />
@@ -136,6 +145,11 @@ export default function AdminDashboard() {
         </div>
 
         <div style={sideColumn}>
+          <QuickLink
+            to="/admin/disparos"
+            title="Disparos"
+            desc="Push em massa, cupons e promocoes."
+          />
           <QuickLink
             to="/admin/pedidos"
             title="Pedidos"

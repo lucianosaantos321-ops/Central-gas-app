@@ -2,10 +2,19 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import Layout from "../layout";
 import { usePedidoStore } from "../store/usePedidoStore";
-import { getAddresses } from "../services/addressStore";
+import { useAuthStore } from "../store/useAuthStore";
+import { useRemoteSyncStore } from "../store/useRemoteSyncStore";
+import { getAddresses, getPrimaryAddressId } from "../services/addressStore";
 import type { Address } from "../services/addressStore";
 import PageHeader from "../components/PageHeader";
 import { couponAdminService } from "../services/couponAdminService";
+import { appLogger } from "../services/appLogger";
+import { saveClientProfilePatch } from "../services/remoteUserStateService";
+import { emitToast } from "../services/realtimeBus";
+import {
+  readLocalUserDocumentPayload,
+  type ClientProfileDocument,
+} from "../services/userStateSchemas";
 
 type ScheduleType = "imediato" | "agendado";
 type Payment = "dinheiro" | "pix" | "cartao";
@@ -45,6 +54,33 @@ function isPastDateTime(dtLocal: string) {
   return d.getTime() < Date.now();
 }
 
+function toUtcIsoFromLocalDateTime(dtLocal: string) {
+  if (!dtLocal) return "";
+  const parsed = new Date(dtLocal);
+  if (!Number.isFinite(parsed.getTime())) return "";
+  return parsed.toISOString();
+}
+
+function getPedidoErrorMessage(error: unknown) {
+  if (!(error instanceof Error) || !error.message) return "";
+
+  const raw = error.message.trim();
+
+  if (raw.startsWith("{") && raw.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(raw) as {
+        message?: string;
+        code?: string;
+      };
+      return String(parsed.message || parsed.code || raw).trim();
+    } catch {
+      return raw;
+    }
+  }
+
+  return raw;
+}
+
 function money(n: number) {
   return n.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 }
@@ -62,18 +98,31 @@ export default function Checkout() {
   const navigate = useNavigate();
 
   const carrinho = usePedidoStore((s) => s.carrinho);
+  const pedidos = usePedidoStore((s) => s.pedidos);
   const criarPedido = usePedidoStore((s) => s.criarPedido);
+  const aumentarQuantidadeCarrinho = usePedidoStore((s) => s.aumentarQuantidadeCarrinho);
+  const diminuirQuantidadeCarrinho = usePedidoStore((s) => s.diminuirQuantidadeCarrinho);
+  const authUserId = useAuthStore((s) => s.user?.id ?? "");
+  const publicVersion = useRemoteSyncStore((s) => s.publicVersion);
+  const clientProfile = useMemo(
+    () =>
+      readLocalUserDocumentPayload("client_profile") as ClientProfileDocument,
+    [publicVersion]
+  );
 
-  const addresses = useMemo(() => getAddresses(), []);
-  const [addressId, setAddressId] = useState<string>(addresses[0]?.id ?? "");
+  const [addresses, setAddresses] = useState<Address[]>(() => getAddresses());
+  const [addressId, setAddressId] = useState<string>(() => {
+    const currentAddresses = getAddresses();
+    return getPrimaryAddressId() || currentAddresses[0]?.id || "";
+  });
 
   const [tipo, setTipo] = useState<ScheduleType>("imediato");
   const [horarioAgendado, setHorarioAgendado] = useState("");
   const [formaPagamento, setFormaPagamento] = useState<Payment>("dinheiro");
 
   const [observacao, setObservacao] = useState("");
-  const [phone, setPhone] = useState(() => maskPhoneBR(safeGet("cg_user_phone", "")));
-  const [clienteNome, setClienteNome] = useState(() => safeGet("cg_cliente_nome", "Cliente"));
+  const [phone, setPhone] = useState(() => maskPhoneBR(clientProfile.telefone || ""));
+  const [clienteNome, setClienteNome] = useState(() => clientProfile.nome || "Cliente");
 
   const [geoStatus, setGeoStatus] = useState<"idle" | "loading" | "ok" | "error">("idle");
   const [geoLink, setGeoLink] = useState(() => safeGet("cg_last_geo_link", ""));
@@ -121,12 +170,48 @@ export default function Checkout() {
   }, [carrinho.length, didSubmit, confirmModal, navigate]);
 
   useEffect(() => {
+    function refreshAddresses() {
+      const currentAddresses = getAddresses();
+      const preferredId = getPrimaryAddressId() || currentAddresses[0]?.id || "";
+      setAddresses(currentAddresses);
+      setAddressId((currentId) => {
+        if (currentAddresses.some((address) => address.id === currentId)) {
+          return currentId;
+        }
+        return preferredId;
+      });
+    }
+
+    refreshAddresses();
+    window.addEventListener("storage", refreshAddresses);
+    window.addEventListener("focus", refreshAddresses);
+    return () => {
+      window.removeEventListener("storage", refreshAddresses);
+      window.removeEventListener("focus", refreshAddresses);
+    };
+  }, []);
+
+  useEffect(() => {
+    setPhone((current) =>
+      current.trim() ? current : maskPhoneBR(clientProfile.telefone || "")
+    );
+    setClienteNome((current) =>
+      current.trim() && current.trim().toLowerCase() !== "cliente"
+        ? current
+        : clientProfile.nome || "Cliente"
+    );
+  }, [clientProfile.nome, clientProfile.telefone]);
+
+  useEffect(() => {
     if (!appliedCoupon?.codigo) return;
 
     const result = couponAdminService.validateForCheckout({
       code: appliedCoupon.codigo,
       subtotal,
       taxaEntrega,
+      clienteId: authUserId,
+      clienteTelefone: phone,
+      pedidos,
     });
 
     if (!result.ok) {
@@ -157,10 +242,22 @@ export default function Checkout() {
     if (!unchanged) {
       setAppliedCoupon(nextCoupon);
     }
-  }, [subtotal, taxaEntrega, appliedCoupon?.codigo]);
+  }, [subtotal, taxaEntrega, appliedCoupon?.codigo, publicVersion, authUserId, phone, pedidos]);
+
+  const orderedAddresses = useMemo(() => {
+    const primaryAddressId = getPrimaryAddressId();
+    return [...addresses].sort((a, b) => {
+      const aScore = a.id === primaryAddressId ? 1 : 0;
+      const bScore = b.id === primaryAddressId ? 1 : 0;
+      if (aScore !== bScore) return bScore - aScore;
+      const aUpdated = new Date(a.updatedAt ?? a.createdAt).getTime();
+      const bUpdated = new Date(b.updatedAt ?? b.createdAt).getTime();
+      return bUpdated - aUpdated;
+    });
+  }, [addresses]);
 
   function selectedAddress(): Address | null {
-    const a = addresses.find((x) => x.id === addressId);
+    const a = orderedAddresses.find((x) => x.id === addressId);
     return a ?? null;
   }
 
@@ -177,13 +274,9 @@ export default function Checkout() {
     return `https://www.google.com/maps?q=${lat},${lng}`;
   }
 
-  function buildPinMapLink(lat: number, lng: number) {
-    return `https://www.google.com/maps/search/?api=1&query=${lat},${lng}`;
-  }
-
   function usarMinhaLocalizacao() {
     if (!("geolocation" in navigator)) {
-      alert("Seu navegador não suporta localização.");
+      emitToast("Localizacao indisponivel", "Seu navegador nao suporta localizacao.", "warning");
       return;
     }
 
@@ -207,14 +300,22 @@ export default function Checkout() {
         setGeoStatus("ok");
 
         if (ok) {
-          alert("Localização salva ✅");
+          emitToast("Localizacao salva", "O link do mapa foi copiado para facilitar a entrega.", "success");
         } else {
-          alert("Localização gerada ✅\nCopie manualmente:\n" + link);
+          emitToast(
+            "Localizacao gerada",
+            "Nao consegui copiar automaticamente. Use o link exibido abaixo.",
+            "info"
+          );
         }
       },
       () => {
         setGeoStatus("error");
-        alert("Não consegui pegar sua localização. Verifique a permissão do navegador.");
+        emitToast(
+          "Falha na localizacao",
+          "Nao consegui pegar sua localizacao. Verifique a permissao do navegador.",
+          "error"
+        );
       },
       { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
@@ -230,6 +331,9 @@ export default function Checkout() {
       code: couponCode,
       subtotal,
       taxaEntrega,
+      clienteId: authUserId,
+      clienteTelefone: phone,
+      pedidos,
     });
 
     if (!result.ok) {
@@ -260,8 +364,8 @@ export default function Checkout() {
     const id = orderId || null;
 
     setConfirmModal({
-      title: "Pedido confirmado ✅",
-      subtitle: "Seu pedido foi enviado. Agora acompanhe o status, o PIN de segurança e a entrega em andamento.",
+      title: "Pedido confirmado",
+      subtitle: "Seu pedido foi enviado. Agora acompanhe o status, o PIN de segurança e a entrega pelo app.",
       cta: "Acompanhar agora",
       onCta: () => {
         setConfirmModal(null);
@@ -271,55 +375,51 @@ export default function Checkout() {
     });
   }
 
-  function confirmarPedido() {
+  async function confirmarPedido() {
     if (submitting || carrinho.length === 0) return;
 
     if (!clienteNome.trim()) {
-      alert("Informe seu nome.");
+      emitToast("Nome obrigatorio", "Informe seu nome para confirmar o pedido.", "warning");
       return;
     }
 
     if (!validarTelefoneObrigatorio()) {
-      alert("Informe um telefone válido com DDD (ex: (61) 99999-9999).");
+      emitToast("Telefone invalido", "Informe um telefone valido com DDD.", "warning");
       return;
     }
 
     const phoneDigits = onlyDigits(phone);
 
-    safeSet("cg_user_phone", phoneDigits);
-    safeSet("cg_cliente_telefone", phoneDigits);
-    safeSet("cg_cliente_nome", clienteNome.trim());
+    saveClientProfilePatch({
+      nome: clienteNome.trim(),
+    });
 
     if (!addressId) {
-      alert("Selecione um endereço para entrega.");
+      emitToast("Endereço obrigatório", "Selecione um endereço para entrega.", "warning");
       return;
     }
 
     if (tipo === "agendado") {
       if (!horarioAgendado) {
-        alert("Selecione a data e hora do agendamento.");
+        emitToast("Agendamento incompleto", "Selecione a data e hora do agendamento.", "warning");
         return;
       }
       if (isPastDateTime(horarioAgendado)) {
-        alert("Não é possível agendar no passado.");
+        emitToast("Horario invalido", "Nao e possivel agendar no passado.", "warning");
         return;
       }
     }
 
     const endereco = selectedAddress();
+    const observacaoFinal = observacao.trim() || null;
 
-    const obsParts: string[] = [];
-    if (observacao.trim()) obsParts.push(observacao.trim());
-    obsParts.push(`Telefone: ${maskPhoneBR(phone)}`);
-
-    if (geoLat != null && geoLng != null) {
-      obsParts.push(`PIN MAPA: ${buildPinMapLink(geoLat, geoLng)}`);
-    } else if (geoLink) {
-      obsParts.push(`Localização (Maps): ${geoLink}`);
-    }
-
-    if (appliedCoupon) {
-      obsParts.push(`Cupom aplicado: ${appliedCoupon.codigo}`);
+    if (!authUserId) {
+      emitToast(
+        "Acesso pendente",
+        "Seu acesso ainda está sendo preparado. Tente novamente em instantes.",
+        "warning"
+      );
+      return;
     }
 
     const enderecoSnapshot = endereco
@@ -336,16 +436,19 @@ export default function Checkout() {
       setSubmitting(true);
       setDidSubmit(true);
 
-      const novo = criarPedido({
-        clienteId: "cliente_local",
+      const novo = await criarPedido({
+        clienteId: authUserId,
         tipo,
-        horarioAgendado: tipo === "agendado" ? horarioAgendado : null,
+        horarioAgendado:
+          tipo === "agendado"
+            ? toUtcIsoFromLocalDateTime(horarioAgendado)
+            : null,
         taxaEntrega,
         taxaEntregaFinal,
         formaPagamento,
         enderecoId: endereco?.id ?? null,
         enderecoSnapshot,
-        observacao: obsParts.join("\n"),
+        observacao: observacaoFinal,
         clienteNome: clienteNome.trim(),
         clienteTelefone: phoneDigits,
         descontoAplicado,
@@ -362,9 +465,18 @@ export default function Checkout() {
 
       openConfirmedModal(novo.id);
     } catch (error) {
-      console.error("Checkout confirmarPedido error:", error);
+      appLogger.error("checkout", "confirmar_pedido_failed", error, {
+        tipo,
+        addressId,
+        authUserId,
+      });
       setDidSubmit(false);
-      alert("Ocorreu um erro ao confirmar o pedido.");
+      const detail = getPedidoErrorMessage(error);
+      emitToast(
+        "Falha ao confirmar",
+        detail || "Ocorreu um erro ao confirmar o pedido.",
+        "error"
+      );
     } finally {
       setSubmitting(false);
     }
@@ -372,10 +484,10 @@ export default function Checkout() {
 
   const cardStyle: React.CSSProperties = {
     background: "#fff",
-    borderRadius: 20,
+    borderRadius: 18,
     border: "1px solid rgba(0,0,0,0.08)",
-    boxShadow: "0 10px 24px rgba(0,0,0,.05)",
-    padding: 16,
+    boxShadow: "0 8px 18px rgba(15,23,42,0.05)",
+    padding: 14,
     marginTop: 12,
   };
 
@@ -401,12 +513,54 @@ export default function Checkout() {
   return (
     <Layout>
       <div style={{ paddingBottom: 96 }}>
-        <PageHeader title="Checkout" subtitle="Confirme os dados para concluir o pedido" />
+        <PageHeader title="Finalizar pedido" subtitle="Revise os itens e confirme os dados da entrega" />
 
         <div style={heroCard}>
-          <div style={heroTitle}>Finalizar com segurança</div>
+          <div style={heroTitle}>Revise e confirme</div>
           <div style={heroSub}>
-            Seu pedido terá PIN de segurança e acompanhamento em tempo real dentro do app.
+            Seu pedido terá PIN de segurança e acompanhamento pelo app.
+          </div>
+          <div style={heroSummaryRow}>
+            <div style={heroSummaryPill}>{carrinho.length} item(ns)</div>
+            <div style={heroSummaryPill}>Entrega {money(taxaEntregaFinal)}</div>
+            <div style={heroSummaryPill}>Total {money(total)}</div>
+          </div>
+        </div>
+
+        <div style={cardStyle}>
+          <div style={sectionTitle}>Itens do carrinho</div>
+
+          <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
+            {carrinho.map((item) => (
+              <div key={item.produtoId} style={cartRow}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={cartItemName}>{item.nome}</div>
+                  <div style={cartItemMeta}>{money(item.precoUnitario)} por unidade</div>
+                </div>
+
+                <div style={cartControls}>
+                  <button
+                    onClick={() => diminuirQuantidadeCarrinho(item.produtoId)}
+                    style={qtyBtn}
+                    type="button"
+                    aria-label={`Diminuir ${item.nome}`}
+                  >
+                    -
+                  </button>
+
+                  <div style={qtyValue}>{item.quantidade}</div>
+
+                  <button
+                    onClick={() => aumentarQuantidadeCarrinho(item.produtoId)}
+                    style={qtyBtnPrimary}
+                    type="button"
+                    aria-label={`Aumentar ${item.nome}`}
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
 
@@ -457,10 +611,10 @@ export default function Checkout() {
               onChange={(e) => setAddressId(e.target.value)}
               style={{ ...inputStyle, cursor: "pointer" }}
             >
-              {addresses.length === 0 ? (
+              {orderedAddresses.length === 0 ? (
                 <option value="">Nenhum endereço cadastrado</option>
               ) : (
-                addresses.map((a) => (
+                orderedAddresses.map((a) => (
                   <option key={a.id} value={a.id}>
                     {a.label}
                   </option>
@@ -469,7 +623,7 @@ export default function Checkout() {
             </select>
 
             <button
-              onClick={() => navigate("/my-addresses")}
+              onClick={() => navigate("/my-addresses", { state: { returnTo: "/checkout" } })}
               style={secondaryBtn}
               type="button"
             >
@@ -486,19 +640,19 @@ export default function Checkout() {
               type="button"
             >
               {geoStatus === "loading"
-                ? "Pegando localização..."
+                ? "Localizando..."
                 : geoLat != null && geoLng != null
                 ? "Atualizar ponto no mapa"
                 : "Marcar meu ponto atual"}
             </button>
 
             <div style={{ marginTop: 8, color: "#666", fontSize: 12, lineHeight: 1.5 }}>
-              Isso salva latitude e longitude para o entregador abrir a rota com mais precisão.
+              Salve o ponto da entrega para facilitar a rota do entregador.
             </div>
 
             {geoLat != null && geoLng != null ? (
               <div style={geoBox}>
-                <div style={{ fontWeight: 900, color: "#111827" }}>Ponto salvo ✅</div>
+                <div style={{ fontWeight: 900, color: "#111827" }}>Ponto salvo</div>
                 <div style={{ marginTop: 6, color: "#475569", fontSize: 13 }}>
                   Lat: {geoLat.toFixed(6)} • Lng: {geoLng.toFixed(6)}
                 </div>
@@ -582,7 +736,7 @@ export default function Checkout() {
             </select>
 
             <div style={{ marginTop: 10, color: "#64748B", fontSize: 12.5, lineHeight: 1.5 }}>
-              Pagamento integrado completo pode entrar depois. Por agora, o pedido já fica pronto para evolução futura.
+              Escolha como prefere pagar no recebimento do pedido.
             </div>
           </div>
         </div>
@@ -598,15 +752,15 @@ export default function Checkout() {
               placeholder="Digite seu cupom"
             />
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-              <button onClick={aplicarCupom} type="button" style={primarySmallBtn}>
-                Aplicar cupom
-              </button>
-
+            {appliedCoupon ? (
               <button onClick={removerCupom} type="button" style={secondaryBtnInline}>
                 Remover cupom
               </button>
-            </div>
+            ) : (
+              <button onClick={aplicarCupom} type="button" style={primarySmallBtn}>
+                Aplicar cupom
+              </button>
+            )}
 
             {couponMessage ? (
               <div
@@ -645,7 +799,7 @@ export default function Checkout() {
           <textarea
             value={observacao}
             onChange={(e) => setObservacao(e.target.value)}
-            placeholder="Ex: portaria, casa do fundo, referência, bloco, apartamento..."
+            placeholder="Ex.: portaria, casa do fundo, referência, bloco ou apartamento"
             style={textAreaStyle}
           />
         </div>
@@ -736,12 +890,6 @@ export default function Checkout() {
               {confirmModal.cta}
             </button>
 
-            <div
-              onClick={confirmModal.onCta}
-              style={modalLinkLike}
-            >
-              Clique aqui para acompanhar →
-            </div>
           </div>
         </div>
       )}
@@ -767,6 +915,26 @@ const heroSub: React.CSSProperties = {
   fontSize: 13,
   opacity: 0.94,
   lineHeight: 1.5,
+};
+
+const heroSummaryRow: React.CSSProperties = {
+  marginTop: 12,
+  display: "flex",
+  gap: 8,
+  flexWrap: "wrap",
+};
+
+const heroSummaryPill: React.CSSProperties = {
+  minHeight: 30,
+  padding: "0 12px",
+  borderRadius: 999,
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  background: "rgba(255,255,255,0.16)",
+  border: "1px solid rgba(255,255,255,0.22)",
+  fontSize: 12,
+  fontWeight: 900,
 };
 
 const sectionTitle: React.CSSProperties = {
@@ -831,6 +999,64 @@ const geoLinkBtn: React.CSSProperties = {
   textDecoration: "none",
   color: "#E44F2A",
   fontWeight: 900,
+};
+
+const cartRow: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 12,
+  padding: 14,
+  borderRadius: 18,
+  background: "#F8FAFC",
+  border: "1px solid rgba(15,23,42,0.08)",
+};
+
+const cartItemName: React.CSSProperties = {
+  fontWeight: 900,
+  color: "#111827",
+  fontSize: 15,
+};
+
+const cartItemMeta: React.CSSProperties = {
+  marginTop: 6,
+  color: "#64748B",
+  fontSize: 12.5,
+  fontWeight: 700,
+};
+
+const cartControls: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 10,
+  flexShrink: 0,
+};
+
+const qtyBtn: React.CSSProperties = {
+  width: 38,
+  height: 38,
+  borderRadius: 12,
+  border: "1px solid rgba(15,23,42,0.12)",
+  background: "#fff",
+  color: "#64748B",
+  fontWeight: 900,
+  fontSize: 18,
+  cursor: "pointer",
+};
+
+const qtyBtnPrimary: React.CSSProperties = {
+  ...qtyBtn,
+  border: "none",
+  background: "linear-gradient(90deg,#E44F2A,#F7A212)",
+  color: "#fff",
+  boxShadow: "0 10px 22px rgba(228,79,42,0.18)",
+};
+
+const qtyValue: React.CSSProperties = {
+  minWidth: 20,
+  textAlign: "center",
+  fontWeight: 900,
+  color: "#111827",
 };
 
 const choiceBtn: React.CSSProperties = {
@@ -933,11 +1159,4 @@ const modalCtaBtn: React.CSSProperties = {
   boxShadow: "0 10px 26px rgba(228,79,42,0.22)",
 };
 
-const modalLinkLike: React.CSSProperties = {
-  marginTop: 10,
-  textAlign: "center",
-  color: "#E44F2A",
-  fontWeight: 900,
-  cursor: "pointer",
-  userSelect: "none",
-};
+

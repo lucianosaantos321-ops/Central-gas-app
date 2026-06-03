@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+﻿import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 
 type Props = {
   label: string;
@@ -156,7 +156,7 @@ export default function SlideAction({
           opacity: completed ? 1 : 0.96,
         }}
       >
-        {completed ? "Confirmado ✅" : label}
+        {completed ? "Confirmado" : label}
       </div>
 
       <div
@@ -167,7 +167,7 @@ export default function SlideAction({
           background: colors.knob,
         }}
       >
-        ›
+        →
       </div>
     </div>
   );

@@ -1,10 +1,21 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, type CSSProperties } from "react";
 import { useNavigate } from "react-router-dom";
 import Layout from "../layout";
 import PageHeader from "../components/PageHeader";
+import { appLogger } from "../services/appLogger";
 import { usePedidoStore } from "../store/usePedidoStore";
 import { pedidoService } from "../services/pedidoService";
+import { useRemoteSyncStore } from "../store/useRemoteSyncStore";
 import type { Pedido } from "../types";
+import {
+  primaryButtonStyle,
+  sectionCardStyle,
+  ui,
+} from "../styles/ui";
+import {
+  readLocalUserDocumentPayload,
+  type ClientProfileDocument,
+} from "../services/userStateSchemas";
 
 type PedidoLike = Pedido & {
   descontoAplicado?: number;
@@ -14,21 +25,21 @@ type PedidoLike = Pedido & {
 function statusColor(status: string) {
   switch (status) {
     case "criado":
-      return "#999";
+      return "#6B7280";
     case "confirmado":
-      return "#1E88E5";
+      return "#2563EB";
     case "buscando_entregador":
-      return "#6D4C41";
+      return "#92400E";
     case "preparando":
-      return "#FB8C00";
+      return "#EA580C";
     case "saiu_para_entrega":
-      return "#8E24AA";
+      return "#7C3AED";
     case "entregue":
-      return "#43A047";
+      return "#16A34A";
     case "cancelado":
       return "#B91C1C";
     default:
-      return "#999";
+      return "#6B7280";
   }
 }
 
@@ -56,36 +67,48 @@ function statusLabel(status: string) {
 function statusSubtitle(status: string) {
   switch (status) {
     case "criado":
-      return "Seu pedido foi criado";
+      return "Pedido criado no sistema";
     case "confirmado":
-      return "Pedido confirmado pela loja";
+      return "Loja confirmou seu pedido";
     case "buscando_entregador":
-      return "Buscando entregador disponível";
+      return "Buscando entregador proximo";
     case "preparando":
-      return "Entregador encontrado • preparando para sair";
+      return "Pedido em preparacao";
     case "saiu_para_entrega":
-      return "O entregador está a caminho";
+      return "Entregador a caminho";
     case "entregue":
       return "Pedido finalizado";
     case "cancelado":
-      return "Pedido cancelado";
+      return "Pedido encerrado";
     default:
-      return "Aguardando atualização";
+      return "Aguardando atualizacao";
+  }
+}
+
+function statusEta(status: string) {
+  switch (status) {
+    case "criado":
+      return "Tempo estimado: ate 45 min";
+    case "confirmado":
+      return "Tempo estimado: 20 a 35 min";
+    case "buscando_entregador":
+      return "Tempo estimado: 5 a 10 min";
+    case "preparando":
+      return "Tempo estimado: 10 a 20 min";
+    case "saiu_para_entrega":
+      return "Tempo estimado: chegando em breve";
+    case "entregue":
+      return "Entrega concluida";
+    case "cancelado":
+      return "Fluxo encerrado";
+    default:
+      return "Aguardando atualizacao";
   }
 }
 
 function money(v: number) {
   const n = Number(v || 0);
-  return n.toFixed(2).replace(".", ",");
-}
-
-function safeGet(key: string, fallback = "") {
-  try {
-    const v = localStorage.getItem(key);
-    return v && v.trim() ? v : fallback;
-  } catch {
-    return fallback;
-  }
+  return n.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 }
 
 function normalizePedidos(list: PedidoLike[]) {
@@ -101,12 +124,8 @@ function normalizePedidos(list: PedidoLike[]) {
       continue;
     }
 
-    const existingTime = new Date(
-      existing.updatedAt ?? existing.createdAt ?? 0
-    ).getTime();
-    const incomingTime = new Date(
-      pedido.updatedAt ?? pedido.createdAt ?? 0
-    ).getTime();
+    const existingTime = new Date(existing.updatedAt ?? existing.createdAt ?? 0).getTime();
+    const incomingTime = new Date(pedido.updatedAt ?? pedido.createdAt ?? 0).getTime();
 
     map.set(id, incomingTime >= existingTime ? pedido : existing);
   }
@@ -114,38 +133,52 @@ function normalizePedidos(list: PedidoLike[]) {
   return Array.from(map.values());
 }
 
+function compactRegion(order: any) {
+  return (
+    order?.enderecoSnapshot?.bairro ??
+    order?.enderecoSnapshot?.neighborhood ??
+    order?.enderecoSnapshot?.cidade ??
+    order?.enderecoSnapshot?.city ??
+    "Nao informada"
+  );
+}
+
 export default function Orders() {
   const navigate = useNavigate();
   const pedidos = usePedidoStore((s) => s.pedidos);
-  const replacePedidos = usePedidoStore((s) => s.replacePedidos);
+  const loadingRemote = usePedidoStore((s) => s.loadingRemote);
+  const remoteReady = usePedidoStore((s) => s.remoteReady);
+  const refetchPedidos = usePedidoStore((s) => s.refetchPedidos);
+  const publicVersion = useRemoteSyncStore((s) => s.publicVersion);
+  const clientProfile = useMemo(
+    () =>
+      readLocalUserDocumentPayload("client_profile") as ClientProfileDocument,
+    [publicVersion]
+  );
 
-  const [loadingRemote, setLoadingRemote] = useState(false);
-  const [remoteReady, setRemoteReady] = useState(false);
-
-  const clienteTelefone = useMemo(() => safeGet("cg_cliente_telefone", ""), []);
-  const clienteNome = useMemo(() => safeGet("cg_cliente_nome", ""), []);
+  const clienteTelefone = useMemo(() => clientProfile.telefone || "", [clientProfile.telefone]);
+  const clienteNome = useMemo(() => clientProfile.nome || "", [clientProfile.nome]);
 
   const refreshPedidos = useCallback(async () => {
     try {
-      setLoadingRemote(true);
-      const data = await pedidoService.listarPedidosRemotos();
-      if (Array.isArray(data)) {
-        replacePedidos(normalizePedidos(data as PedidoLike[]));
-        setRemoteReady(true);
-      }
+      await refetchPedidos();
     } catch (error) {
-      console.error("Orders refreshPedidos error:", error);
-    } finally {
-      setLoadingRemote(false);
+      appLogger.error("orders", "refresh_pedidos_failed", error);
     }
-  }, [replacePedidos]);
+  }, [refetchPedidos]);
 
   useEffect(() => {
     void refreshPedidos();
+    const stopRealtime = pedidoService.subscribePedidosRealtime(() => {
+      void refreshPedidos();
+    });
     const timer = window.setInterval(() => {
       void refreshPedidos();
-    }, 2500);
-    return () => window.clearInterval(timer);
+    }, 8000);
+    return () => {
+      stopRealtime();
+      window.clearInterval(timer);
+    };
   }, [refreshPedidos]);
 
   const pedidosFiltrados = useMemo(() => {
@@ -159,19 +192,12 @@ export default function Orders() {
       const pedidoPhoneDigits = String(p?.clienteTelefone || "").replace(/\D/g, "");
       const pedidoNome = String(p?.clienteNome || "").trim().toLowerCase();
 
-      if (phoneDigits && pedidoPhoneDigits && pedidoPhoneDigits === phoneDigits) {
-        return true;
-      }
-
-      if (nameLower && pedidoNome && pedidoNome === nameLower) {
-        return true;
-      }
-
+      if (phoneDigits && pedidoPhoneDigits && pedidoPhoneDigits === phoneDigits) return true;
+      if (nameLower && pedidoNome && pedidoNome === nameLower) return true;
       return false;
     });
 
-    if (matched.length > 0) return matched;
-    return base;
+    return matched.length > 0 ? matched : base;
   }, [pedidos, clienteTelefone, clienteNome]);
 
   const { active, history } = useMemo(() => {
@@ -181,281 +207,118 @@ export default function Orders() {
         new Date(a?.updatedAt ?? a?.createdAt ?? 0).getTime()
     );
 
-    const a = ordered.filter(
-      (p: any) => p.status !== "entregue" && p.status !== "cancelado"
-    );
-    const h = ordered.filter(
-      (p: any) => p.status === "entregue" || p.status === "cancelado"
-    );
-
-    return { active: a, history: h };
+    return {
+      active: ordered.filter((p: any) => p.status !== "entregue" && p.status !== "cancelado"),
+      history: ordered.filter((p: any) => p.status === "entregue" || p.status === "cancelado"),
+    };
   }, [pedidosFiltrados]);
-
-  function renderEndereco(p: any) {
-    const e = p?.enderecoSnapshot;
-    if (!e) return null;
-
-    const rua = e.street ?? e.rua ?? "";
-    const numero = e.number ?? e.numero ?? "";
-    const bairro = e.neighborhood ?? e.bairro ?? "";
-    const cidade = e.city ?? e.cidade ?? "";
-
-    return (
-      <div
-        style={{
-          marginTop: 8,
-          fontSize: 13,
-          opacity: 0.9,
-          lineHeight: 1.5,
-        }}
-      >
-        <strong>Endereço</strong>
-        <div style={{ marginTop: 6 }}>
-          {rua}
-          {rua && numero ? ", " : ""}
-          {numero}
-          <br />
-          {bairro}
-          {bairro && cidade ? "/" : ""}
-          {cidade}
-        </div>
-      </div>
-    );
-  }
-
-  function renderItens(p: any) {
-    const itens = Array.isArray(p?.itens) ? p.itens : [];
-    if (itens.length === 0) {
-      return <div style={{ opacity: 0.7 }}>Itens não disponíveis</div>;
-    }
-
-    return (
-      <div style={{ marginTop: 12 }}>
-        <div
-          style={{
-            fontWeight: 900,
-            marginBottom: 6,
-            color: "#111827",
-          }}
-        >
-          Itens
-        </div>
-
-        {itens.map((i: any, index: number) => (
-          <div
-            key={`${i.produtoId ?? i.nome ?? "item"}-${index}`}
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              gap: 12,
-              marginTop: 6,
-              fontSize: 14,
-            }}
-          >
-            <span>
-              {i.quantidade}x {i.nome}
-            </span>
-            <span style={{ fontWeight: 800 }}>
-              R$ {money((i.precoUnitario || 0) * (i.quantidade || 0))}
-            </span>
-          </div>
-        ))}
-      </div>
-    );
-  }
 
   function PedidoCard({ order, highlighted }: { order: any; highlighted?: boolean }) {
     const color = statusColor(order?.status);
-    const label = statusLabel(order?.status);
+    const itens = Array.isArray(order?.itens) ? order.itens : [];
+    const resumoItens = itens.length > 0 ? itens.map((item: any) => `${item.quantidade}x ${item.nome}`).join(", ") : "Itens indisponiveis";
 
     return (
-      <div
+      <button
         onClick={() => navigate(`/orders/${order.id}`)}
+        type="button"
         style={{
-          background: "#fff",
-          padding: 18,
-          borderRadius: 24,
-          marginTop: 12,
-          boxShadow: "0 10px 24px rgba(0,0,0,.05)",
-          cursor: "pointer",
+          ...card,
           border: highlighted
-            ? "2px solid #E44F2A"
+            ? "2px solid rgba(228,79,42,0.38)"
             : order?.status === "cancelado"
-            ? "2px solid rgba(185,28,28,0.18)"
-            : "1px solid #eee",
+            ? "1px solid rgba(185,28,28,0.16)"
+            : "1px solid rgba(15,23,42,0.08)",
         }}
       >
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "flex-start",
-            gap: 12,
-          }}
-        >
-          <div style={{ minWidth: 0 }}>
-            <div
-              style={{
-                fontWeight: 950,
-                fontSize: 16,
-                color: "#111827",
-              }}
-            >
-              Pedido #{String(order.id).slice(0, 6)}
+        <div style={cardTop}>
+            <div style={{ minWidth: 0 }}>
+              <div style={cardTitle}>Pedido #{String(order.id).slice(0, 6)}</div>
+              <div style={cardSubtitle}>{statusSubtitle(order?.status)}</div>
+              <div style={etaBadge}>{statusEta(order?.status)}</div>
             </div>
-            <div style={{ marginTop: 6, fontSize: 13, color: "#666" }}>
-              {statusSubtitle(order?.status)}
-            </div>
-          </div>
 
           <span
             style={{
-              padding: "6px 10px",
-              borderRadius: 999,
-              background: `${color}22`,
+              ...statusPill,
+              background: `${color}18`,
               color,
-              fontWeight: 900,
-              fontSize: 12,
-              whiteSpace: "nowrap",
+              border: `1px solid ${color}22`,
             }}
           >
-            {label}
+            {statusLabel(order?.status)}
           </span>
         </div>
 
-        {order?.deliveryPin &&
-        order?.status !== "entregue" &&
-        order?.status !== "cancelado" ? (
+        {order?.tipo === "agendado" && order?.horarioAgendado ? (
+          <div style={scheduledBox}>
+            Agendado para {new Date(order.horarioAgendado).toLocaleString("pt-BR")}
+          </div>
+        ) : null}
+
+        {order?.deliveryPin && order?.status !== "entregue" && order?.status !== "cancelado" ? (
           <div style={pinPill}>PIN: {order.deliveryPin}</div>
         ) : null}
+
+        <div style={compactInfoGrid}>
+          <div style={compactInfoBox}>
+            <div style={compactLabel}>Itens</div>
+            <div style={compactValueText}>{resumoItens}</div>
+          </div>
+
+          <div style={compactInfoBox}>
+            <div style={compactLabel}>Data</div>
+            <div style={compactValueText}>
+              {new Date(order?.updatedAt ?? order?.createdAt ?? Date.now()).toLocaleString("pt-BR")}
+            </div>
+          </div>
+
+          <div style={compactInfoBox}>
+            <div style={compactLabel}>Valor</div>
+            <div style={compactValueMoney}>{money(order?.total)}</div>
+          </div>
+
+          <div style={compactInfoBox}>
+            <div style={compactLabel}>Regiao</div>
+            <div style={compactValueText}>{compactRegion(order)}</div>
+          </div>
+        </div>
 
         {order?.cupomCodigo ? (
           <div style={couponPill}>
             Cupom: {order.cupomCodigo}
-            {order?.descontoAplicado
-              ? ` • Desconto: R$ ${money(order.descontoAplicado)}`
-              : ""}
+            {order?.descontoAplicado ? ` • Desconto: ${money(order.descontoAplicado)}` : ""}
           </div>
         ) : null}
-
-        {order?.tipo === "agendado" && order?.horarioAgendado ? (
-          <div style={{ marginTop: 10, fontSize: 14, lineHeight: 1.5 }}>
-            <strong>Agendado para</strong>
-            <div style={{ marginTop: 6 }}>
-              {new Date(order.horarioAgendado).toLocaleString("pt-BR")}
-            </div>
-          </div>
-        ) : null}
-
-        {renderItens(order)}
-
-        <div
-          style={{
-            borderTop: "1px dashed #eee",
-            marginTop: 14,
-            paddingTop: 12,
-            fontSize: 14,
-          }}
-        >
-          <div style={{ display: "flex", justifyContent: "space-between" }}>
-            <span>Subtotal</span>
-            <strong>R$ {money(order?.subtotal)}</strong>
-          </div>
-
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              marginTop: 6,
-            }}
-          >
-            <span>Entrega</span>
-            <strong>R$ {money(order?.taxaEntrega)}</strong>
-          </div>
-
-          {Number(order?.descontoAplicado || 0) > 0 ? (
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                marginTop: 6,
-              }}
-            >
-              <span>Desconto</span>
-              <strong style={{ color: "#16A34A" }}>
-                - R$ {money(order?.descontoAplicado)}
-              </strong>
-            </div>
-          ) : null}
-
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              marginTop: 10,
-              fontSize: 15,
-            }}
-          >
-            <strong>Total</strong>
-            <strong style={{ color: "#E44F2A" }}>
-              R$ {money(order?.total)}
-            </strong>
-          </div>
-        </div>
-
-        {renderEndereco(order)}
 
         {order?.status === "cancelado" ? (
           <div style={cancelBox}>
             <strong>Motivo:</strong> {order?.motivoCancelamento || "Sem motivo informado"}
-            {order?.observacaoCancelamento ? (
-              <div style={{ marginTop: 6 }}>
-                <strong>Obs:</strong> {order.observacaoCancelamento}
-              </div>
-            ) : null}
           </div>
         ) : null}
 
-        {order?.observacao && order?.status !== "cancelado" ? (
-          <div style={{ marginTop: 10, fontSize: 13, lineHeight: 1.5 }}>
-            <strong>Obs:</strong> {order.observacao}
-          </div>
-        ) : null}
-      </div>
+        <div style={tapHint}>Toque para ver detalhes completos</div>
+      </button>
     );
   }
 
   return (
     <Layout>
       <div style={{ paddingBottom: 96 }}>
-        <PageHeader
-          title="Pedidos"
-          subtitle="Acompanhe seus pedidos em andamento e o histórico"
-        />
+        <PageHeader title="Pedidos" subtitle="Acompanhe seus pedidos em andamento e o histórico" />
 
         <div style={syncLine}>
-          Fonte atual: {remoteReady ? "Supabase" : "Aguardando sync"}
-          {loadingRemote ? " • sincronizando..." : ""}
+          Atualização: {remoteReady ? "ao vivo" : "reconectando"}
+          {loadingRemote ? " • atualizando..." : ""}
         </div>
 
         {pedidosFiltrados.length === 0 && (
           <div style={emptyCard}>
             <h3 style={{ marginTop: 0 }}>Nenhum pedido ainda</h3>
-            <p
-              style={{
-                opacity: 0.82,
-                marginTop: 6,
-                lineHeight: 1.5,
-              }}
-            >
-              Quando você fizer um pedido, ele aparece aqui com o status, o PIN e os detalhes.
+            <p style={{ opacity: 0.82, marginTop: 6, lineHeight: 1.5 }}>
+              Quando voce fizer um pedido, ele aparece aqui com status e resumo rapido.
             </p>
-
-            <button
-              onClick={() => navigate("/loja")}
-              style={primaryBtn}
-              type="button"
-            >
+            <button onClick={() => navigate("/loja")} style={primaryBtn} type="button">
               Pedir agora
             </button>
           </div>
@@ -483,33 +346,78 @@ export default function Orders() {
   );
 }
 
-const emptyCard: React.CSSProperties = {
-  background: "#fff",
-  padding: 20,
-  borderRadius: 24,
+const emptyCard: CSSProperties = {
+  ...sectionCardStyle({
+    padding: 20,
   marginTop: 16,
-  boxShadow: "0 10px 24px rgba(0,0,0,.05)",
+  }),
 };
 
-const primaryBtn: React.CSSProperties = {
-  marginTop: 12,
-  background: "#E44F2A",
-  border: "none",
-  color: "#fff",
-  fontWeight: 900,
-  width: "100%",
-  padding: 14,
-  borderRadius: 18,
-  cursor: "pointer",
+const primaryBtn: CSSProperties = {
+  ...primaryButtonStyle({
+    marginTop: 12,
+    width: "100%",
+    padding: 14,
+  }),
 };
 
-const sectionTitle: React.CSSProperties = {
+const sectionTitle: CSSProperties = {
   marginBottom: 8,
   color: "#111827",
 };
 
-const pinPill: React.CSSProperties = {
+const card: CSSProperties = {
+  width: "100%",
   marginTop: 12,
+  ...sectionCardStyle({
+    padding: 16,
+  }),
+  cursor: "pointer",
+  textAlign: "left",
+};
+
+const cardTop: CSSProperties = {
+  display: "flex",
+  justifyContent: "space-between",
+  alignItems: "flex-start",
+  gap: 12,
+};
+
+const cardTitle: CSSProperties = {
+  fontWeight: 950,
+  fontSize: 16,
+  color: "#111827",
+};
+
+const cardSubtitle: CSSProperties = {
+  marginTop: 6,
+  fontSize: 13,
+  color: "#64748B",
+  lineHeight: 1.45,
+};
+
+const etaBadge: CSSProperties = {
+  marginTop: 8,
+  display: "inline-flex",
+  alignItems: "center",
+  padding: "6px 10px",
+  borderRadius: 999,
+  background: "rgba(17,24,39,0.05)",
+  color: ui.color.textSoft,
+  fontSize: 12,
+  fontWeight: 800,
+};
+
+const statusPill: CSSProperties = {
+  padding: "6px 10px",
+  borderRadius: 999,
+  fontWeight: 900,
+  fontSize: 12,
+  whiteSpace: "nowrap",
+};
+
+const pinPill: CSSProperties = {
+  marginTop: 10,
   display: "inline-flex",
   padding: "8px 12px",
   borderRadius: 999,
@@ -520,32 +428,86 @@ const pinPill: React.CSSProperties = {
   fontSize: 13,
 };
 
-const couponPill: React.CSSProperties = {
+const scheduledBox: CSSProperties = {
   marginTop: 10,
-  display: "inline-flex",
+  padding: "10px 12px",
+  borderRadius: 16,
+  background: "rgba(228,79,42,0.08)",
+  border: "1px solid rgba(228,79,42,0.14)",
+  color: "#9A3412",
+  fontWeight: 800,
+  fontSize: 13,
+};
+
+const compactInfoGrid: CSSProperties = {
+  marginTop: 12,
+  display: "grid",
+  gridTemplateColumns: "1fr 1fr",
+  gap: 10,
+};
+
+const compactInfoBox: CSSProperties = {
+  background: "#F8FAFC",
+  border: "1px solid rgba(15,23,42,0.06)",
+  borderRadius: 16,
+  padding: 12,
+};
+
+const compactLabel: CSSProperties = {
+  fontSize: 11.5,
+  fontWeight: 900,
+  textTransform: "uppercase",
+  color: "#64748B",
+};
+
+const compactValueText: CSSProperties = {
+  marginTop: 6,
+  fontSize: 13,
+  color: "#111827",
+  lineHeight: 1.45,
+};
+
+const compactValueMoney: CSSProperties = {
+  marginTop: 6,
+  fontSize: 15,
+  fontWeight: 950,
+  color: "#E44F2A",
+};
+
+const couponPill: CSSProperties = {
+  marginTop: 10,
   padding: "8px 12px",
   borderRadius: 999,
-  background: "rgba(22,163,74,0.10)",
-  border: "1px solid rgba(22,163,74,0.16)",
+  background: "rgba(22,163,74,0.08)",
   color: "#166534",
-  fontWeight: 900,
+  border: "1px solid rgba(22,163,74,0.16)",
+  fontWeight: 800,
   fontSize: 12.5,
 };
 
-const cancelBox: React.CSSProperties = {
+const cancelBox: CSSProperties = {
   marginTop: 12,
   padding: 12,
   borderRadius: 16,
   background: "rgba(185,28,28,0.06)",
-  border: "1px solid rgba(185,28,28,0.14)",
   color: "#7F1D1D",
-  fontSize: 13,
+  border: "1px solid rgba(185,28,28,0.14)",
   lineHeight: 1.5,
+  fontSize: 13,
 };
 
-const syncLine: React.CSSProperties = {
+const tapHint: CSSProperties = {
+  marginTop: 12,
+  fontSize: 12.5,
+  color: "#64748B",
+  fontWeight: 700,
+};
+
+const syncLine: CSSProperties = {
   marginTop: 12,
   fontSize: 12,
   fontWeight: 900,
   color: "#64748B",
 };
+
+

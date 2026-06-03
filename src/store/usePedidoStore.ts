@@ -6,15 +6,29 @@ import type {
   EnderecoSnapshot,
   StatusPedido,
   CanceladoPor,
-  DeliveryConfirmationMethod,
 } from "../types";
 import { pedidoService } from "../services/pedidoService";
-import { resetAfterDelivery } from "../services/gasTank";
+import {
+  resetAfterDeliveryForOrder,
+  syncGasTankFromDeliveredOrders,
+} from "../services/gasTank";
 import { emitToast } from "../services/realtimeBus";
+import { clientNotificationCenter } from "../services/clientNotificationCenter";
 import { iniciarFluxoEntrega } from "../services/entregadorEngine";
 import { financeService } from "../services/financeService";
 import { adminRulesService } from "../services/adminRulesService";
 import { couponAdminService } from "../services/couponAdminService";
+import { appLogger } from "../services/appLogger";
+import { trackMetric } from "../services/appMetrics";
+import {
+  readLocalUserDocumentPayload,
+  type ClientProfileDocument,
+} from "../services/userStateSchemas";
+
+const CLIENT_STATUS_NOTICE_KEY = "cg_client_status_notice_v1";
+const CLIENT_SCHEDULED_NOTICE_KEY = "cg_client_scheduled_notice_v1";
+const ONE_HOUR_MS = 60 * 60 * 1000;
+const scheduledReminderTimers = new Map<string, number>();
 
 interface CancelarPedidoInput {
   pedidoId: string;
@@ -54,19 +68,23 @@ interface PedidoState {
   carrinho: ItemPedido[];
   pedidos: Pedido[];
   pedidoAtual: Pedido | null;
+  loadingRemote: boolean;
+  remoteReady: boolean;
   adicionarAoCarrinho: (item: ItemPedido) => void;
   aumentarQuantidadeCarrinho: (produtoId: string) => void;
   diminuirQuantidadeCarrinho: (produtoId: string) => void;
   removerDoCarrinho: (produtoId: string) => void;
   limparCarrinho: () => void;
-  criarPedido: (dados: CriarPedidoInput) => Pedido | null;
-  atribuirEntregador: (pedidoId: string, entregadorId: string) => void;
-  atualizarStatus: (pedidoId: string, status: Pedido["status"]) => void;
-  cancelarPedido: (input: CancelarPedidoInput) => boolean;
-  confirmarEntregaComPin: (input: ConfirmarEntregaInput) => boolean;
-  marcarEntregaManual: (pedidoId: string) => boolean;
+  criarPedido: (dados: CriarPedidoInput) => Promise<Pedido | null>;
+  atribuirEntregador: (pedidoId: string, entregadorId: string) => Promise<Pedido | null>;
+  atualizarStatus: (pedidoId: string, status: Pedido["status"]) => Promise<Pedido | null>;
+  cancelarPedido: (input: CancelarPedidoInput) => Promise<boolean>;
+  confirmarEntregaComPin: (input: ConfirmarEntregaInput) => Promise<boolean>;
+  marcarEntregaManual: (pedidoId: string) => Promise<boolean>;
   replacePedidos: (pedidos: Pedido[]) => void;
   upsertPedidoLocal: (pedido: Pedido) => void;
+  refetchPedidos: () => Promise<void>;
+  refetchPedidoById: (pedidoId: string) => Promise<Pedido | null>;
 }
 
 function toastByStatus(status: string) {
@@ -122,21 +140,79 @@ function toastByStatus(status: string) {
   }
 }
 
-function canAutoPrepare(current: StatusPedido) {
-  return (
-    current === "criado" ||
-    current === "confirmado" ||
-    current === "buscando_entregador"
-  );
-}
-
 function safeText(value: unknown) {
   if (value == null) return "";
   return String(value).trim();
 }
 
+function isClientRuntime() {
+  if (typeof window === "undefined") return false;
+  const path = String(window.location.pathname || "").trim().toLowerCase();
+  return !path.startsWith("/admin") && !path.startsWith("/entregador");
+}
+
+function shouldUseLocalNativeClientNotification() {
+  if (typeof window === "undefined") return false;
+
+  const hasNativeAndroid =
+    typeof navigator !== "undefined" &&
+    /android/i.test(String(navigator.userAgent || ""));
+
+  // Em Android nativo, priorizamos o push remoto do sistema e evitamos duplicar
+  // com uma segunda notificação local gerada pelo próprio app.
+  return !hasNativeAndroid;
+}
+
+function buildPedidoRoute(pedidoId: string) {
+  const id = safeText(pedidoId);
+  if (!id || typeof window === "undefined") return "";
+
+  const path = String(window.location.pathname || "").trim().toLowerCase();
+
+  if (path.startsWith("/entregador")) {
+    return `/entregador/pedido/${id}`;
+  }
+
+  if (path.startsWith("/admin")) {
+    return "/admin/pedidos";
+  }
+
+  return `/orders/${id}`;
+}
+
+function clientPedidoNotificationsEnabled() {
+  if (typeof window === "undefined") return false;
+  try {
+    const profile = readLocalUserDocumentPayload(
+      "client_profile"
+    ) as ClientProfileDocument;
+    return Boolean(profile.notifsPedido ?? true);
+  } catch {
+    return true;
+  }
+}
+
+function readNotificationMap(key: string) {
+  if (typeof window === "undefined") return {} as Record<string, string>;
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeNotificationMap(key: string, value: Record<string, string>) {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // ignore
+  }
+}
+
 function normalizePin(value: string) {
-  return safeText(value).replace(/\D/g, "");
+  return safeText(value).replace(/\D/g, "").slice(0, 4);
 }
 
 function shouldAuditCancellation(
@@ -226,45 +302,200 @@ function upsertPedidoInList(list: Pedido[], pedido: Pedido) {
   );
 }
 
+function dedupePedidos(list: Pedido[]) {
+  const map = new Map<string, Pedido>();
+
+  for (const pedido of list) {
+    const id = String(pedido?.id ?? "").trim();
+    if (!id) continue;
+
+    const existing = map.get(id);
+    if (!existing) {
+      map.set(id, pedido);
+      continue;
+    }
+
+    const existingTime = getPedidoSortTime(existing);
+    const incomingTime = getPedidoSortTime(pedido);
+    map.set(id, incomingTime >= existingTime ? pedido : existing);
+  }
+
+  return Array.from(map.values());
+}
+
+function clearMissingScheduledReminderTimers(activeIds: Set<string>) {
+  for (const [pedidoId, timerId] of scheduledReminderTimers.entries()) {
+    if (activeIds.has(pedidoId)) continue;
+    window.clearTimeout(timerId);
+    scheduledReminderTimers.delete(pedidoId);
+  }
+}
+
+function scheduleClientNotifications(previousPedidos: Pedido[], nextPedidos: Pedido[]) {
+  if (!isClientRuntime() || !clientPedidoNotificationsEnabled()) return;
+  if (!shouldUseLocalNativeClientNotification()) return;
+
+  const previousById = new Map(
+    previousPedidos.map((pedido) => [String(pedido.id), pedido] as const)
+  );
+  const nextIds = new Set<string>();
+  const statusMap = readNotificationMap(CLIENT_STATUS_NOTICE_KEY);
+  const scheduledMap = readNotificationMap(CLIENT_SCHEDULED_NOTICE_KEY);
+  let statusMapChanged = false;
+  let scheduledMapChanged = false;
+
+  for (const pedido of nextPedidos) {
+    const pedidoId = String(pedido.id || "").trim();
+    if (!pedidoId) continue;
+    nextIds.add(pedidoId);
+
+    const previous = previousById.get(pedidoId);
+    if (previous && previous.status !== pedido.status) {
+      const stamp = `${pedido.status}@${safeText(pedido.updatedAt || pedido.createdAt)}`;
+      if (statusMap[pedidoId] !== stamp) {
+        const notification = toastByStatus(String(pedido.status));
+        emitToast(notification.title, notification.msg, notification.variant, {
+          native: shouldUseLocalNativeClientNotification(),
+          route: buildPedidoRoute(pedidoId),
+        });
+        clientNotificationCenter.add({
+          title: notification.title,
+          message: notification.msg,
+          route: buildPedidoRoute(pedidoId),
+          kind: "pedido",
+          dedupeKey: `pedido_status_${pedidoId}_${pedido.status}`,
+        });
+        statusMap[pedidoId] = stamp;
+        statusMapChanged = true;
+      }
+    }
+
+    const isScheduled =
+      pedido.tipo === "agendado" &&
+      pedido.status !== "entregue" &&
+      pedido.status !== "cancelado" &&
+      safeText(pedido.horarioAgendado);
+
+    if (!isScheduled) {
+      const timerId = scheduledReminderTimers.get(pedidoId);
+      if (timerId != null) {
+        window.clearTimeout(timerId);
+        scheduledReminderTimers.delete(pedidoId);
+      }
+      if (scheduledMap[pedidoId]) {
+        delete scheduledMap[pedidoId];
+        scheduledMapChanged = true;
+      }
+      continue;
+    }
+
+    const scheduleTime = Date.parse(String(pedido.horarioAgendado));
+    if (!Number.isFinite(scheduleTime)) continue;
+
+    const reminderAt = scheduleTime - ONE_HOUR_MS;
+    const delay = reminderAt - Date.now();
+    const stamp = String(pedido.horarioAgendado);
+
+    if (delay <= 0) {
+      if (scheduledMap[pedidoId] !== stamp) {
+        emitToast(
+          "Pedido agendado se aproximando",
+          `Seu pedido #${pedidoId.slice(0, 6)} esta a menos de 1 hora do horario agendado.`,
+          "info",
+          {
+            native: shouldUseLocalNativeClientNotification(),
+            route: buildPedidoRoute(pedidoId),
+          }
+        );
+        clientNotificationCenter.add({
+          title: "Pedido agendado se aproximando",
+          message: `Seu pedido #${pedidoId.slice(0, 6)} esta a menos de 1 hora do horario agendado.`,
+          route: buildPedidoRoute(pedidoId),
+          kind: "pedido",
+          dedupeKey: `pedido_agendado_${pedidoId}_${stamp}`,
+        });
+        scheduledMap[pedidoId] = stamp;
+        scheduledMapChanged = true;
+      }
+      const timerId = scheduledReminderTimers.get(pedidoId);
+      if (timerId != null) {
+        window.clearTimeout(timerId);
+        scheduledReminderTimers.delete(pedidoId);
+      }
+      continue;
+    }
+
+    if (!scheduledReminderTimers.has(pedidoId)) {
+      const timerId = window.setTimeout(() => {
+        if (!isClientRuntime() || !clientPedidoNotificationsEnabled()) return;
+        const currentMap = readNotificationMap(CLIENT_SCHEDULED_NOTICE_KEY);
+        if (currentMap[pedidoId] === stamp) return;
+        emitToast(
+          "Pedido agendado se aproximando",
+          `Seu pedido #${pedidoId.slice(0, 6)} esta a menos de 1 hora do horario agendado.`,
+          "info",
+          {
+            native: shouldUseLocalNativeClientNotification(),
+            route: buildPedidoRoute(pedidoId),
+          }
+        );
+        clientNotificationCenter.add({
+          title: "Pedido agendado se aproximando",
+          message: `Seu pedido #${pedidoId.slice(0, 6)} esta a menos de 1 hora do horario agendado.`,
+          route: buildPedidoRoute(pedidoId),
+          kind: "pedido",
+          dedupeKey: `pedido_agendado_${pedidoId}_${stamp}`,
+        });
+        currentMap[pedidoId] = stamp;
+        writeNotificationMap(CLIENT_SCHEDULED_NOTICE_KEY, currentMap);
+      }, delay);
+      scheduledReminderTimers.set(pedidoId, timerId);
+    }
+  }
+
+  clearMissingScheduledReminderTimers(nextIds);
+
+  if (statusMapChanged) {
+    writeNotificationMap(CLIENT_STATUS_NOTICE_KEY, statusMap);
+  }
+
+  if (scheduledMapChanged) {
+    writeNotificationMap(CLIENT_SCHEDULED_NOTICE_KEY, scheduledMap);
+  }
+}
+
 function syncFinanceSnapshot(pedidos: Pedido[]) {
   try {
     financeService.syncDeliveredOrders(pedidos);
   } catch (error) {
-    console.error("syncFinanceSnapshot error:", error);
+    appLogger.error("pedido_store", "sync_finance_snapshot_failed", error, {
+      pedidosCount: pedidos.length,
+    });
   }
 }
 
-function syncPedidoSafely(pedido: Pedido | null | undefined) {
-  if (!pedido) return;
+function applyPedidoMutation(
+  set: (
+    partial:
+      | Partial<PedidoState>
+      | ((state: PedidoState) => Partial<PedidoState>)
+  ) => void,
+  pedido: Pedido
+) {
+  set((state) => {
+    const pedidos = upsertPedidoInList(state.pedidos, pedido);
+    scheduleClientNotifications(state.pedidos, pedidos);
+    syncFinanceSnapshot(pedidos);
+    syncGasTankFromDeliveredOrders(pedidos);
 
-  try {
-    pedidoService.syncPedido(pedido);
-  } catch (error) {
-    console.error("syncPedidoSafely error:", error);
-  }
-}
-
-function gerarComissaoSeNecessario(pedido: Pedido): Pedido {
-  if (
-    pedido.status !== "entregue" ||
-    !pedido.entregadorId ||
-    pedido.comissaoGerada
-  ) {
-    return pedido;
-  }
-
-  const valorComissao = Number(
-    pedido.comissaoApp ??
-      adminRulesService.getRules().comissaoPorEntrega ??
-      10
-  );
-
-  financeService.addComissao(pedido.entregadorId, pedido.id, valorComissao);
-
-  return patchPedidoFields(pedido, {
-    comissaoGerada: true,
-    comissaoGeradaEm: new Date().toISOString(),
-    comissaoApp: valorComissao,
+    return {
+      pedidos,
+      pedidoAtual:
+        state.pedidoAtual?.id === pedido.id
+          ? pedido
+          : state.pedidoAtual ?? pedido,
+      remoteReady: true,
+    };
   });
 }
 
@@ -290,6 +521,8 @@ export const usePedidoStore = create<PedidoState>()(
       carrinho: [],
       pedidos: [],
       pedidoAtual: null,
+      loadingRemote: false,
+      remoteReady: false,
 
       adicionarAoCarrinho: (item) =>
         set((state) => {
@@ -339,7 +572,7 @@ export const usePedidoStore = create<PedidoState>()(
 
       limparCarrinho: () => set({ carrinho: [] }),
 
-      criarPedido: (dados) => {
+      criarPedido: async (dados) => {
         const { carrinho } = get();
 
         if (carrinho.length === 0) {
@@ -398,192 +631,142 @@ export const usePedidoStore = create<PedidoState>()(
           comissaoGeradaEm: null,
         });
 
-        syncPedidoSafely(pedidoComComissaoBase);
-
-        const novoPedido = pedidoService.atualizarStatus(
-          pedidoComComissaoBase,
-          "buscando_entregador"
+        const pedidoRemoto = await pedidoService.salvarPedidoRemoto(
+          pedidoComComissaoBase
         );
 
-        set((state) => {
-          const pedidos = sortPedidos([novoPedido, ...state.pedidos]);
-          syncFinanceSnapshot(pedidos);
+        if (!pedidoRemoto) {
+          throw new Error("Nao foi possivel criar o pedido remoto.");
+        }
 
-          return {
-            pedidos,
-            pedidoAtual: novoPedido,
-            carrinho: [],
-          };
+        set({ carrinho: [] });
+        applyPedidoMutation(set, pedidoRemoto);
+        appLogger.audit("pedido_store", "pedido_criado", "Pedido criado com sucesso.", {
+          pedidoId: pedidoRemoto.id,
+          status: pedidoRemoto.status,
+          tipo: pedidoRemoto.tipo,
+          total: pedidoRemoto.total,
+        });
+        trackMetric("pedido_created", {
+          pedidoId: pedidoRemoto.id,
+          status: pedidoRemoto.status,
+          tipo: pedidoRemoto.tipo,
+          total: pedidoRemoto.total,
         });
 
         if (dados.cupomId) {
           couponAdminService.registerUse(dados.cupomId);
         }
 
-        iniciarFluxoEntrega(novoPedido.id);
+        if (
+          pedidoRemoto.status === "buscando_entregador" &&
+          !pedidoRemoto.entregadorId
+        ) {
+          iniciarFluxoEntrega(pedidoRemoto.id);
+        }
         emitToast(
           "Pedido enviado ✅",
-          "Estamos buscando um entregador.",
-          "success"
+          dados.tipo === "agendado"
+            ? "Seu pedido agendado foi criado e entrara no fluxo no horario escolhido."
+            : "Seu pedido foi criado e ja esta entrando no fluxo.",
+          "success",
+          {
+            native: true,
+            route: buildPedidoRoute(String(pedidoRemoto.id)),
+          }
         );
 
-        return novoPedido;
+        void get().refetchPedidoById(pedidoRemoto.id);
+
+        return pedidoRemoto;
       },
 
-      atribuirEntregador: (pedidoId, entregadorId) =>
-        set((state) => {
-          const alvo = state.pedidos.find(
-            (p) => String(p.id) === String(pedidoId)
+      atribuirEntregador: async (pedidoId, entregadorId) => {
+        const alvo = get().pedidos.find(
+          (p) => String(p.id) === String(pedidoId)
+        );
+
+        if (!alvo) return null;
+
+        if (financeService.isBloqueado(entregadorId)) {
+          emitToast(
+            "Entregador bloqueado",
+            "Saldo pendente acima do limite. Regularize o repasse para continuar.",
+            "warning"
           );
+          return null;
+        }
 
-          if (!alvo) return state;
+        if (
+          alvo.entregadorId &&
+          String(alvo.entregadorId) !== String(entregadorId)
+        ) {
+          emitToast(
+            "Indisponível",
+            "Outro entregador já aceitou este pedido.",
+            "warning"
+          );
+          return null;
+        }
 
-          if (financeService.isBloqueado(entregadorId)) {
-            emitToast(
-              "Entregador bloqueado",
-              "Saldo pendente acima do limite. Regularize o repasse para continuar.",
-              "warning"
-            );
-            return state;
+        const pedidoAtualizado = await pedidoService.atribuirEntregadorRemoto(
+          pedidoId,
+          entregadorId
+        );
+
+        if (!pedidoAtualizado) return null;
+
+        applyPedidoMutation(set, pedidoAtualizado);
+        appLogger.audit(
+          "pedido_store",
+          "pedido_atribuido",
+          "Pedido atribuido ao entregador.",
+          {
+            pedidoId: pedidoAtualizado.id,
+            entregadorId,
+            status: pedidoAtualizado.status,
           }
+        );
+        trackMetric("pedido_assigned", {
+          pedidoId: pedidoAtualizado.id,
+          entregadorId,
+          status: pedidoAtualizado.status,
+        });
 
-          if (
-            alvo.entregadorId &&
-            String(alvo.entregadorId) !== String(entregadorId)
-          ) {
-            emitToast(
-              "Indisponível",
-              "Outro entregador já aceitou este pedido.",
-              "warning"
-            );
-            return state;
-          }
+        const t = toastByStatus(String(pedidoAtualizado.status));
+        emitToast(t.title, t.msg, t.variant);
+        void get().refetchPedidoById(String(pedidoId));
 
-          const now = new Date().toISOString();
-          const shouldPrepare = canAutoPrepare(alvo.status);
-          const nextStatus: StatusPedido = shouldPrepare
-            ? "preparando"
-            : alvo.status;
+        return pedidoAtualizado;
+      },
 
-          let pedidoSincronizado: Pedido | null = null;
+      atualizarStatus: async (pedidoId, status) => {
+        const pedidoAtualizado = await pedidoService.atualizarStatusRemoto(
+          pedidoId,
+          status
+        );
 
-          const pedidosAtualizados = state.pedidos.map((p) => {
-            if (String(p.id) !== String(pedidoId)) return p;
+        if (!pedidoAtualizado) return null;
 
-            const historicoBase = Array.isArray(p.historico)
-              ? p.historico
-              : [];
+        applyPedidoMutation(set, pedidoAtualizado);
+        appLogger.audit("pedido_store", "pedido_status_atualizado", "Status do pedido atualizado.", {
+          pedidoId: pedidoAtualizado.id,
+          status: pedidoAtualizado.status,
+        });
+        trackMetric("pedido_status_changed", {
+          pedidoId: pedidoAtualizado.id,
+          status: pedidoAtualizado.status,
+        });
 
-            const historicoNext =
-              shouldPrepare && p.status !== "preparando"
-                ? [
-                    ...historicoBase,
-                    { status: "preparando" as const, data: now },
-                  ]
-                : historicoBase;
+        const t = toastByStatus(String(pedidoAtualizado.status));
+        emitToast(t.title, t.msg, t.variant);
+        void get().refetchPedidoById(String(pedidoId));
 
-            const atualizado: Pedido = {
-              ...p,
-              entregadorId,
-              status: nextStatus,
-              historico: historicoNext,
-              updatedAt: now,
-            };
+        return pedidoAtualizado;
+      },
 
-            pedidoSincronizado = atualizado;
-            return atualizado;
-          });
-
-          const pedidoAtualAtualizado =
-            state.pedidoAtual?.id === pedidoId
-              ? (() => {
-                  const historicoBase = Array.isArray(
-                    state.pedidoAtual?.historico
-                  )
-                    ? state.pedidoAtual.historico
-                    : [];
-
-                  const historicoNext =
-                    shouldPrepare &&
-                    state.pedidoAtual?.status !== "preparando"
-                      ? [
-                          ...historicoBase,
-                          { status: "preparando" as const, data: now },
-                        ]
-                      : historicoBase;
-
-                  return {
-                    ...state.pedidoAtual,
-                    entregadorId,
-                    status: nextStatus,
-                    historico: historicoNext,
-                    updatedAt: now,
-                  } as Pedido;
-                })()
-              : state.pedidoAtual;
-
-          if (
-            !pedidoSincronizado &&
-            pedidoAtualAtualizado &&
-            String(pedidoAtualAtualizado.id) === String(pedidoId)
-          ) {
-            pedidoSincronizado = pedidoAtualAtualizado;
-          }
-
-          syncPedidoSafely(pedidoSincronizado);
-
-          const pedidos = sortPedidos(pedidosAtualizados);
-          syncFinanceSnapshot(pedidos);
-
-          const t = toastByStatus(nextStatus);
-          emitToast(t.title, t.msg, t.variant);
-
-          return {
-            pedidos,
-            pedidoAtual: pedidoAtualAtualizado,
-          };
-        }),
-
-      atualizarStatus: (pedidoId, status) =>
-        set((state) => {
-          const pedidosAtualizados = state.pedidos.map((p) => {
-            if (String(p.id) !== String(pedidoId)) return p;
-
-            let updated = pedidoService.atualizarStatus(p, status);
-            updated = gerarComissaoSeNecessario(updated);
-            syncPedidoSafely(updated);
-            return updated;
-          });
-
-          let pedidoAtualAtualizado =
-            state.pedidoAtual?.id === pedidoId
-              ? pedidoService.atualizarStatus(state.pedidoAtual, status)
-              : state.pedidoAtual;
-
-          if (pedidoAtualAtualizado?.id === pedidoId) {
-            pedidoAtualAtualizado =
-              gerarComissaoSeNecessario(pedidoAtualAtualizado);
-            syncPedidoSafely(pedidoAtualAtualizado);
-          }
-
-          const pedidos = sortPedidos(pedidosAtualizados);
-          syncFinanceSnapshot(pedidos);
-
-          const t = toastByStatus(String(status));
-          emitToast(t.title, t.msg, t.variant);
-
-          if (status === "entregue") {
-            resetAfterDelivery();
-          }
-
-          return {
-            pedidos,
-            pedidoAtual: pedidoAtualAtualizado,
-          };
-        }),
-
-      cancelarPedido: (input) => {
-        const { pedidos, pedidoAtual } = get();
+      cancelarPedido: async (input) => {
+        const { pedidos } = get();
 
         const alvo = pedidos.find((p) => p.id === input.pedidoId);
 
@@ -610,7 +793,6 @@ export const usePedidoStore = create<PedidoState>()(
           return false;
         }
 
-        const now = new Date().toISOString();
         const motivo = safeText(input.motivoCancelamento);
         const obs = safeText(input.observacaoCancelamento);
 
@@ -625,34 +807,41 @@ export const usePedidoStore = create<PedidoState>()(
           motivoCancelamento: motivo,
         });
 
-        const updatedPedido = patchPedidoFields(
-          pedidoService.atualizarStatus(alvo, "cancelado"),
+        const updatedPedido = await pedidoService.cancelarPedidoRemoto(
           {
+            pedidoId: input.pedidoId,
             canceladoPor: input.canceladoPor,
             motivoCancelamento: motivo || "Sem motivo informado",
             observacaoCancelamento: obs || null,
-            canceladoEm: now,
-            cancelamentoAuditavel: auditavel || suspeito,
-            cancelamentoSuspeito: suspeito,
-            cancelamentoLat: Number.isFinite(Number(input.lat))
+            lat: Number.isFinite(Number(input.lat))
               ? Number(input.lat)
               : null,
-            cancelamentoLng: Number.isFinite(Number(input.lng))
+            lng: Number.isFinite(Number(input.lng))
               ? Number(input.lng)
               : null,
           }
         );
 
-        syncPedidoSafely(updatedPedido);
+        if (!updatedPedido) return false;
 
-        set({
-          pedidos: pedidos.map((p) =>
-            p.id === input.pedidoId ? updatedPedido : p
-          ),
-          pedidoAtual:
-            pedidoAtual?.id === input.pedidoId
-              ? updatedPedido
-              : pedidoAtual,
+        applyPedidoMutation(set, {
+          ...updatedPedido,
+          cancelamentoAuditavel:
+            updatedPedido.cancelamentoAuditavel ?? (auditavel || suspeito),
+          cancelamentoSuspeito:
+            updatedPedido.cancelamentoSuspeito ?? suspeito,
+        });
+        appLogger.audit("pedido_store", "pedido_cancelado", "Pedido cancelado.", {
+          pedidoId: updatedPedido.id,
+          canceladoPor: input.canceladoPor,
+          suspeito,
+          auditavel,
+        });
+        trackMetric("pedido_cancelled", {
+          pedidoId: updatedPedido.id,
+          canceladoPor: input.canceladoPor,
+          suspeito,
+          auditavel,
         });
 
         emitToast(
@@ -662,21 +851,27 @@ export const usePedidoStore = create<PedidoState>()(
             : input.canceladoPor === "entregador"
             ? "Esse cancelamento será auditado e poderemos entrar em contato com o cliente."
             : "Seu pedido foi cancelado.",
-          "warning"
+          "warning",
+          {
+            native: true,
+            route: buildPedidoRoute(String(input.pedidoId)),
+          }
         );
+
+        void get().refetchPedidoById(String(input.pedidoId));
 
         return true;
       },
 
-      confirmarEntregaComPin: (input) => {
+      confirmarEntregaComPin: async (input) => {
         const pinInformado = normalizePin(input.pin);
 
-        if (!pinInformado) {
-          emitToast("PIN inválido", "Informe um PIN válido.", "warning");
+        if (pinInformado.length !== 4) {
+          emitToast("PIN inválido", "Informe um PIN de 4 dígitos.", "warning");
           return false;
         }
 
-        const { pedidos, pedidoAtual } = get();
+        const { pedidos } = get();
         const alvo = pedidos.find((p) => p.id === input.pedidoId);
 
         if (!alvo) {
@@ -693,51 +888,47 @@ export const usePedidoStore = create<PedidoState>()(
           return false;
         }
 
-        const pinSalvo = normalizePin(alvo.deliveryPin || "");
+        const updatedPedido = await pedidoService.confirmarEntregaRemota(
+          input.pedidoId,
+          pinInformado
+        );
 
-        if (!pinSalvo || pinSalvo !== pinInformado) {
-          emitToast(
-            "PIN inválido",
-            "O PIN informado não confere.",
-            "warning"
-          );
-          return false;
-        }
+        if (!updatedPedido) return false;
 
-        let updatedPedido = pedidoService.atualizarStatus(alvo, "entregue");
-
-        updatedPedido = patchPedidoFields(updatedPedido, {
-          pinVerified: true,
-          pinVerifiedAt: new Date().toISOString(),
-          deliveryConfirmationMethod: "pin" as DeliveryConfirmationMethod,
+        applyPedidoMutation(set, updatedPedido);
+        appLogger.audit(
+          "pedido_store",
+          "pedido_entregue_pin",
+          "Entrega confirmada com PIN.",
+          {
+            pedidoId: updatedPedido.id,
+            status: updatedPedido.status,
+          }
+        );
+        trackMetric("pedido_delivered_pin", {
+          pedidoId: updatedPedido.id,
+          status: updatedPedido.status,
         });
 
-        updatedPedido = gerarComissaoSeNecessario(updatedPedido);
-        syncPedidoSafely(updatedPedido);
-
-        set({
-          pedidos: pedidos.map((p) =>
-            p.id === input.pedidoId ? updatedPedido : p
-          ),
-          pedidoAtual:
-            pedidoAtual?.id === input.pedidoId
-              ? updatedPedido
-              : pedidoAtual,
-        });
-
-        resetAfterDelivery();
+        resetAfterDeliveryForOrder(updatedPedido.id);
 
         emitToast(
           "Entrega confirmada ✅",
           "PIN validado com sucesso. Comissão do app registrada.",
-          "success"
+          "success",
+          {
+            native: true,
+            route: buildPedidoRoute(String(input.pedidoId)),
+          }
         );
+
+        void get().refetchPedidoById(String(input.pedidoId));
 
         return true;
       },
 
-      marcarEntregaManual: (pedidoId) => {
-        const { pedidos, pedidoAtual } = get();
+      marcarEntregaManual: async (pedidoId) => {
+        const { pedidos } = get();
         const alvo = pedidos.find((p) => p.id === pedidoId);
 
         if (!alvo) {
@@ -757,34 +948,40 @@ export const usePedidoStore = create<PedidoState>()(
           return false;
         }
 
-        let updatedPedido = pedidoService.atualizarStatus(alvo, "entregue");
+        const updatedPedido = await pedidoService.confirmarEntregaManualRemota(
+          pedidoId
+        );
 
-        updatedPedido = patchPedidoFields(updatedPedido, {
-          deliveryConfirmationMethod: "manual" as DeliveryConfirmationMethod,
-          pinVerified: false,
-          pinVerifiedAt: null,
+        if (!updatedPedido) return false;
+
+        applyPedidoMutation(set, updatedPedido);
+        appLogger.audit(
+          "pedido_store",
+          "pedido_entregue_manual",
+          "Entrega manual registrada.",
+          {
+            pedidoId: updatedPedido.id,
+            status: updatedPedido.status,
+          }
+        );
+        trackMetric("pedido_delivered_manual", {
+          pedidoId: updatedPedido.id,
+          status: updatedPedido.status,
         });
 
-        updatedPedido = gerarComissaoSeNecessario(updatedPedido);
-        syncPedidoSafely(updatedPedido);
-
-        set({
-          pedidos: pedidos.map((p) =>
-            p.id === pedidoId ? updatedPedido : p
-          ),
-          pedidoAtual:
-            pedidoAtual?.id === pedidoId
-              ? updatedPedido
-              : pedidoAtual,
-        });
-
-        resetAfterDelivery();
+        resetAfterDeliveryForOrder(updatedPedido.id);
 
         emitToast(
           "Entrega manual",
           "Entrega manual registrada para auditoria.",
-          "warning"
+          "warning",
+          {
+            native: true,
+            route: buildPedidoRoute(String(pedidoId)),
+          }
         );
+
+        void get().refetchPedidoById(String(pedidoId));
 
         return true;
       },
@@ -792,21 +989,26 @@ export const usePedidoStore = create<PedidoState>()(
       replacePedidos: (pedidos) =>
         set((state) => {
           const ordered = sortPedidos(
-            Array.isArray(pedidos) ? pedidos : []
+            dedupePedidos(Array.isArray(pedidos) ? pedidos : [])
           );
 
+          scheduleClientNotifications(state.pedidos, ordered);
           syncFinanceSnapshot(ordered);
+          syncGasTankFromDeliveredOrders(ordered);
 
           return {
             pedidos: ordered,
             pedidoAtual: pickPedidoAtual(ordered, state.pedidoAtual),
+            remoteReady: true,
           };
         }),
 
       upsertPedidoLocal: (pedido) =>
         set((state) => {
           const pedidos = upsertPedidoInList(state.pedidos, pedido);
+          scheduleClientNotifications(state.pedidos, pedidos);
           syncFinanceSnapshot(pedidos);
+          syncGasTankFromDeliveredOrders(pedidos);
 
           return {
             pedidos,
@@ -816,6 +1018,90 @@ export const usePedidoStore = create<PedidoState>()(
                 : state.pedidoAtual ?? pedidos[0] ?? null,
           };
         }),
+
+      refetchPedidos: async () => {
+        set({ loadingRemote: true });
+
+        try {
+          const remote = await pedidoService.listarPedidosPrimarios();
+          if (remote === null) {
+            set((state) => ({
+              loadingRemote: false,
+              remoteReady: state.remoteReady,
+            }));
+            return;
+          }
+
+          const ordered = sortPedidos(
+            dedupePedidos(Array.isArray(remote) ? remote : [])
+          );
+
+          set((state) => {
+            scheduleClientNotifications(state.pedidos, ordered);
+            syncFinanceSnapshot(ordered);
+            syncGasTankFromDeliveredOrders(ordered);
+
+            return {
+              pedidos: ordered,
+              pedidoAtual: pickPedidoAtual(ordered, state.pedidoAtual),
+              remoteReady: true,
+              loadingRemote: false,
+            };
+          });
+        } catch (error) {
+          appLogger.error("pedido_store", "refetch_pedidos_failed", error);
+          set({ loadingRemote: false });
+        }
+      },
+
+      refetchPedidoById: async (pedidoId) => {
+        const id = safeText(pedidoId);
+        if (!id) return null;
+
+        set({ loadingRemote: true });
+
+        try {
+          const pedido = await pedidoService.buscarPedidoPrimarioPorId(id);
+
+          if (pedido === undefined) {
+            set((state) => ({
+              loadingRemote: false,
+              remoteReady: state.remoteReady,
+            }));
+            return null;
+          }
+
+          if (!pedido) {
+            set({ loadingRemote: false, remoteReady: true });
+            return null;
+          }
+
+          set((state) => {
+            const pedidos = upsertPedidoInList(state.pedidos, pedido);
+            scheduleClientNotifications(state.pedidos, pedidos);
+            syncFinanceSnapshot(pedidos);
+            syncGasTankFromDeliveredOrders(pedidos);
+
+            return {
+              pedidos,
+              pedidoAtual:
+                state.pedidoAtual?.id === pedido.id
+                  ? pedido
+                  : state.pedidoAtual ?? pedido,
+              remoteReady: true,
+              loadingRemote: false,
+            };
+          });
+
+          return pedido;
+        } catch (error) {
+          appLogger.error("pedido_store", "refetch_pedido_by_id_failed", error, {
+            pedidoId: id,
+          });
+          set({ loadingRemote: false });
+          return null;
+        }
+      },
     }),
     {
       name: "cg_pedido_store_v1",

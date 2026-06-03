@@ -1,4 +1,5 @@
 import type { CupomCampanha, Pedido } from "../types";
+import { queueRemoteDocumentSave } from "./remoteAppStateService";
 
 const STORAGE_KEY = "cg_coupon_campaigns_v1";
 
@@ -27,6 +28,9 @@ function defaultCoupons(): CupomCampanha[] {
       valor: 10,
       ativo: false,
       usoMaximo: null,
+      usoUnicoPorCliente: true,
+      primeiraCompraApenas: true,
+      expiraEm: null,
       usados: 0,
       minimoPedido: 0,
       createdAt,
@@ -54,6 +58,9 @@ function safeRead(): CupomCampanha[] {
       ativo: Boolean(item?.ativo),
       usoMaximo:
         item?.usoMaximo == null ? null : Number(item.usoMaximo),
+      usoUnicoPorCliente: Boolean(item?.usoUnicoPorCliente),
+      primeiraCompraApenas: Boolean(item?.primeiraCompraApenas),
+      expiraEm: item?.expiraEm ? String(item.expiraEm) : null,
       usados: Number(item?.usados ?? 0),
       minimoPedido:
         item?.minimoPedido == null ? null : Number(item.minimoPedido),
@@ -97,7 +104,24 @@ export const couponAdminService = {
       safeWrite(seeded);
       return seeded;
     }
-    return items.sort(
+    const nowMs = Date.now();
+    const normalized = items.map((item) => {
+      if (!item.ativo || !item.expiraEm) return item;
+      const expiresAt = new Date(item.expiraEm).getTime();
+      if (!Number.isFinite(expiresAt) || nowMs < expiresAt) return item;
+      return {
+        ...item,
+        ativo: false,
+        updatedAt: now(),
+      };
+    });
+
+    if (normalized.some((item, index) => item !== items[index])) {
+      safeWrite(normalized);
+      queueRemoteDocumentSave("coupon_campaigns", normalized);
+    }
+
+    return normalized.sort(
       (a, b) =>
         new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
     );
@@ -113,6 +137,9 @@ export const couponAdminService = {
     code: string;
     subtotal: number;
     taxaEntrega: number;
+    clienteId?: string | null;
+    clienteTelefone?: string | null;
+    pedidos?: Pedido[];
   }): CouponValidationResult {
     const code = String(input.code || "").trim().toUpperCase();
     const subtotal = Number(input.subtotal || 0);
@@ -132,6 +159,14 @@ export const couponAdminService = {
       return { ok: false, message: "Esse cupom está inativo." };
     }
 
+    if (coupon.expiraEm) {
+      const expiresAt = new Date(coupon.expiraEm).getTime();
+      if (Number.isFinite(expiresAt) && Date.now() >= expiresAt) {
+        this.update(coupon.id, { ativo: false });
+        return { ok: false, message: "Esse cupom expirou e foi desativado." };
+      }
+    }
+
     if (coupon.usoMaximo != null && coupon.usados >= coupon.usoMaximo) {
       return { ok: false, message: "Esse cupom atingiu o limite de uso." };
     }
@@ -140,6 +175,39 @@ export const couponAdminService = {
       return {
         ok: false,
         message: `Pedido mínimo para esse cupom: R$ ${Number(coupon.minimoPedido).toFixed(2).replace(".", ",")}.`,
+      };
+    }
+
+    const clienteId = String(input.clienteId || "").trim();
+    const clienteTelefone = String(input.clienteTelefone || "").replace(/\D/g, "");
+    const pedidos = Array.isArray(input.pedidos) ? input.pedidos : [];
+    const pedidosDoCliente = pedidos.filter((pedido) => {
+      const pedidoClienteId = String(pedido?.clienteId || "").trim();
+      const pedidoTelefone = String(pedido?.clienteTelefone || "").replace(/\D/g, "");
+      return Boolean(
+        (clienteId && pedidoClienteId === clienteId) ||
+          (clienteTelefone && pedidoTelefone === clienteTelefone)
+      );
+    });
+
+    if (coupon.primeiraCompraApenas && pedidosDoCliente.length > 0) {
+      return {
+        ok: false,
+        message: "Esse cupom vale apenas para a primeira compra.",
+      };
+    }
+
+    if (
+      coupon.usoUnicoPorCliente &&
+      pedidosDoCliente.some(
+        (pedido) =>
+          String(pedido?.cupomId || "") === coupon.id ||
+          String(pedido?.cupomCodigo || "").toUpperCase() === coupon.codigo
+      )
+    ) {
+      return {
+        ok: false,
+        message: "Esse cupom so pode ser usado uma vez por cliente.",
       };
     }
 
@@ -232,6 +300,9 @@ export const couponAdminService = {
     ativo?: boolean;
     usoMaximo?: number | null;
     minimoPedido?: number | null;
+    usoUnicoPorCliente?: boolean;
+    primeiraCompraApenas?: boolean;
+    expiraEm?: string | null;
   }) {
     const items = this.getAll();
     const createdAt = now();
@@ -245,6 +316,9 @@ export const couponAdminService = {
       valor: Number(input.valor || 0),
       ativo: input.ativo ?? false,
       usoMaximo: input.usoMaximo == null ? null : Number(input.usoMaximo),
+      usoUnicoPorCliente: Boolean(input.usoUnicoPorCliente),
+      primeiraCompraApenas: Boolean(input.primeiraCompraApenas),
+      expiraEm: input.expiraEm ? String(input.expiraEm) : null,
       usados: 0,
       minimoPedido:
         input.minimoPedido == null ? null : Number(input.minimoPedido),
@@ -253,6 +327,7 @@ export const couponAdminService = {
     };
 
     safeWrite([next, ...items]);
+    queueRemoteDocumentSave("coupon_campaigns", [next, ...items]);
     return next;
   },
 
@@ -279,6 +354,20 @@ export const couponAdminService = {
               ? null
               : Number(patch.usoMaximo)
             : item.usoMaximo,
+        usoUnicoPorCliente:
+          patch.usoUnicoPorCliente !== undefined
+            ? Boolean(patch.usoUnicoPorCliente)
+            : item.usoUnicoPorCliente,
+        primeiraCompraApenas:
+          patch.primeiraCompraApenas !== undefined
+            ? Boolean(patch.primeiraCompraApenas)
+            : item.primeiraCompraApenas,
+        expiraEm:
+          patch.expiraEm !== undefined
+            ? patch.expiraEm
+              ? String(patch.expiraEm)
+              : null
+            : item.expiraEm,
         minimoPedido:
           patch.minimoPedido !== undefined
             ? patch.minimoPedido == null
@@ -290,12 +379,14 @@ export const couponAdminService = {
     });
 
     safeWrite(updated);
+    queueRemoteDocumentSave("coupon_campaigns", updated);
     return updated.find((item) => item.id === id) ?? null;
   },
 
   remove(id: string) {
     const items = this.getAll().filter((item) => item.id !== id);
     safeWrite(items);
+    queueRemoteDocumentSave("coupon_campaigns", items);
     return true;
   },
 

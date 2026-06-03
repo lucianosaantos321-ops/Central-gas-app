@@ -16,7 +16,7 @@ export default function ModeGateway() {
 
   function entrarAdmin() {
     clearEntregadorMode();
-    navigate("/admin");
+    navigate("/admin/login");
   }
 
   return (

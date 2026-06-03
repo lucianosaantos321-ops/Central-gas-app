@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Capacitor } from "@capacitor/core";
 import { subscribeRealtime } from "../services/realtimeBus";
 import type { ToastVariant } from "../services/realtimeBus";
 
@@ -39,11 +40,24 @@ function pillColors(variant: ToastVariant) {
   }
 }
 
+function variantLabel(variant: ToastVariant) {
+  switch (variant) {
+    case "success":
+      return "sucesso";
+    case "warning":
+      return "atenção";
+    case "error":
+      return "erro";
+    default:
+      return "info";
+  }
+}
+
 function uid() {
   return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-export default function ToastHost() {
+function ToastHostInner() {
   const [items, setItems] = useState<Toast[]>([]);
   const timersRef = useRef<Record<string, number>>({});
 
@@ -165,7 +179,7 @@ export default function ToastHost() {
                     whiteSpace: "nowrap",
                   }}
                 >
-                  {toast.variant}
+                  {variantLabel(toast.variant)}
                 </div>
               </div>
 
@@ -195,4 +209,12 @@ export default function ToastHost() {
       </div>
     </div>
   );
+}
+
+export default function ToastHost() {
+  if (Capacitor.isNativePlatform()) {
+    return null;
+  }
+
+  return <ToastHostInner />;
 }

@@ -35,7 +35,7 @@ function canVibrate() {
 function vibratePattern() {
   // padrão curto (não agressivo)
   try {
-    navigator.vibrate?.([180, 80, 180]);
+    navigator.vibrate?.([320, 120, 320, 120, 420, 160, 420]);
   } catch {
     // ignore
   }
@@ -52,7 +52,7 @@ function ensureAudioContext(): AudioContext | null {
   }
 }
 
-function beepOnce(freq = 880, ms = 140, gainValue = 0.045) {
+function beepOnce(freq = 2600, ms = 260, gainValue = 0.46) {
   const ctx = ensureAudioContext();
   if (!ctx) return false;
 
@@ -63,7 +63,7 @@ function beepOnce(freq = 880, ms = 140, gainValue = 0.045) {
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
 
-    osc.type = "sine";
+    osc.type = "square";
     osc.frequency.value = freq;
 
     gain.gain.value = gainValue;
@@ -88,13 +88,13 @@ function playAlertBeep(repeat = 2) {
 
   lastBeepAt = now;
 
-  const times = clamp(Number(repeat || 1), 1, 4);
+  const times = clamp(Number(repeat || 1), 1, 5);
   let i = 0;
 
   const seq = () => {
     i += 1;
-    beepOnce(i % 2 === 0 ? 880 : 740, 150);
-    if (i < times) setTimeout(seq, 220);
+    beepOnce(i % 2 === 0 ? 3000 : 2600, 260);
+    if (i < times) setTimeout(seq, 390);
   };
 
   seq();

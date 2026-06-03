@@ -1,43 +1,18 @@
-import { useMemo, useState, type CSSProperties } from "react";
+﻿import { useMemo, useState, type CSSProperties } from "react";
 import AdminLayout from "../../layouts/AdminLayout";
 import { usePedidoStore } from "../../store/usePedidoStore";
+import { useRemoteSyncStore } from "../../store/useRemoteSyncStore";
+import { exportRowsToCsv } from "../../services/csvExportService";
 import { financeService } from "../../services/financeService";
+import { emitToast } from "../../services/realtimeBus";
 import { money, safeText } from "../../utils/delivererHelpers";
 
 type FinanceFilter = "todos" | "devedores" | "bloqueados" | "quitados";
 
-function escapeCsv(value: unknown) {
-  const text = String(value ?? "");
-  const escaped = text.replace(/"/g, '""');
-  return `"${escaped}"`;
-}
-
-function exportRowsToCsv(filename: string, rows: Record<string, unknown>[]) {
-  if (!Array.isArray(rows) || rows.length === 0) {
-    alert("Não há dados para exportar.");
-    return;
-  }
-
-  const headers = Object.keys(rows[0]);
-  const csv = [
-    headers.map(escapeCsv).join(","),
-    ...rows.map((row) => headers.map((key) => escapeCsv(row[key])).join(","))
-  ].join("\n");
-
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename.endsWith(".csv") ? filename : `${filename}.csv`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
 export default function AdminFinanceiro() {
   const pedidos = usePedidoStore((s) => s.pedidos);
+  const publicVersion = useRemoteSyncStore((s) => s.publicVersion);
+  const financeVersion = useRemoteSyncStore((s) => s.financeVersion);
 
   const [refreshKey, setRefreshKey] = useState(0);
   const [filtro, setFiltro] = useState<FinanceFilter>("todos");
@@ -47,14 +22,15 @@ export default function AdminFinanceiro() {
   const [paymentObs, setPaymentObs] = useState("");
   const [adjustValue, setAdjustValue] = useState("");
   const [adjustObs, setAdjustObs] = useState("");
+  const [actionBusy, setActionBusy] = useState<"" | "payment" | "adjust">("");
 
   const syncedStates = useMemo(() => {
     return financeService.syncDeliveredOrders(pedidos) || [];
-  }, [pedidos, refreshKey]);
+  }, [pedidos, refreshKey, publicVersion, financeVersion]);
 
   const summary = useMemo(() => {
     return financeService.getGlobalSummary(pedidos);
-  }, [pedidos, refreshKey]);
+  }, [pedidos, refreshKey, publicVersion, financeVersion]);
 
   const filtered = useMemo(() => {
     const q = busca.trim().toLowerCase();
@@ -123,44 +99,70 @@ export default function AdminFinanceiro() {
 
   function registrarPagamento() {
     if (!selected?.entregadorId) return;
+    if (actionBusy) return;
 
     const valor = Number(paymentValue);
     if (!Number.isFinite(valor) || valor <= 0) {
-      alert("Informe um valor de pagamento válido.");
+      emitToast("Valor invalido", "Informe um valor de pagamento valido.", "warning");
       return;
     }
 
-    financeService.registerPagamento(
-      selected.entregadorId,
-      valor,
-      paymentObs.trim() || "Pagamento manual registrado no ADM"
-    );
+    const saldoAtual = Number(selected.saldoDevedor || 0);
+    if (saldoAtual > 0 && valor > saldoAtual) {
+      emitToast(
+        "Pagamento acima do saldo",
+        `O saldo pendente atual e ${money(saldoAtual)}. Informe um valor menor ou ajuste o saldo antes.`,
+        "warning"
+      );
+      return;
+    }
 
-    alert("Pagamento registrado ✅");
-    setPaymentValue("");
-    setPaymentObs("");
-    refresh();
+    setActionBusy("payment");
+    try {
+      financeService.registerPagamento(
+        selected.entregadorId,
+        valor,
+        paymentObs.trim() || "Pagamento manual registrado no ADM"
+      );
+
+      emitToast("Pagamento registrado", "O pagamento foi salvo no financeiro.", "success");
+      setPaymentValue("");
+      setPaymentObs("");
+      refresh();
+    } finally {
+      setActionBusy("");
+    }
   }
 
   function registrarAjuste() {
     if (!selected?.entregadorId) return;
+    if (actionBusy) return;
 
     const valor = Number(adjustValue);
     if (!Number.isFinite(valor) || valor === 0) {
-      alert("Informe um valor de ajuste válido. Pode ser positivo ou negativo.");
+      emitToast(
+        "Valor invalido",
+        "Informe um valor de ajuste valido. Pode ser positivo ou negativo.",
+        "warning"
+      );
       return;
     }
 
-    financeService.addAjuste(
-      selected.entregadorId,
-      valor,
-      adjustObs.trim() || "Ajuste financeiro manual do ADM"
-    );
+    setActionBusy("adjust");
+    try {
+      financeService.addAjuste(
+        selected.entregadorId,
+        valor,
+        adjustObs.trim() || "Ajuste financeiro manual do ADM"
+      );
 
-    alert("Ajuste financeiro registrado ✅");
-    setAdjustValue("");
-    setAdjustObs("");
-    refresh();
+      emitToast("Ajuste aplicado", "O ajuste financeiro foi registrado.", "success");
+      setAdjustValue("");
+      setAdjustObs("");
+      refresh();
+    } finally {
+      setActionBusy("");
+    }
   }
 
   function exportCsv() {
@@ -326,6 +328,7 @@ export default function AdminFinanceiro() {
                     style={fieldInput}
                     placeholder="Valor pago"
                     inputMode="decimal"
+                    disabled={actionBusy !== ""}
                   />
 
                   <textarea
@@ -333,10 +336,11 @@ export default function AdminFinanceiro() {
                     onChange={(e) => setPaymentObs(e.target.value)}
                     style={fieldTextArea}
                     placeholder="Observação do pagamento"
+                    disabled={actionBusy !== ""}
                   />
 
-                  <button onClick={registrarPagamento} type="button" style={primaryBtn}>
-                    Registrar pagamento
+                  <button onClick={registrarPagamento} type="button" style={primaryBtn} disabled={actionBusy !== ""}>
+                    {actionBusy === "payment" ? "Registrando..." : "Registrar pagamento"}
                   </button>
                 </div>
               </div>
@@ -354,6 +358,7 @@ export default function AdminFinanceiro() {
                     style={fieldInput}
                     placeholder="Ex.: 10 ou -10"
                     inputMode="decimal"
+                    disabled={actionBusy !== ""}
                   />
 
                   <textarea
@@ -361,10 +366,11 @@ export default function AdminFinanceiro() {
                     onChange={(e) => setAdjustObs(e.target.value)}
                     style={fieldTextArea}
                     placeholder="Observação do ajuste"
+                    disabled={actionBusy !== ""}
                   />
 
-                  <button onClick={registrarAjuste} type="button" style={secondaryBtn}>
-                    Registrar ajuste
+                  <button onClick={registrarAjuste} type="button" style={secondaryBtn} disabled={actionBusy !== ""}>
+                    {actionBusy === "adjust" ? "Registrando..." : "Registrar ajuste"}
                   </button>
                 </div>
               </div>
@@ -389,7 +395,7 @@ export default function AdminFinanceiro() {
 
                           <div style={ledgerMeta}>
                             {new Date(item.data).toLocaleString("pt-BR")}
-                            {item.pedidoId ? ` • Pedido ${String(item.pedidoId).slice(0, 6)}` : ""}
+                            {item.pedidoId ? ` | Pedido ${String(item.pedidoId).slice(0, 6)}` : ""}
                           </div>
 
                           {safeText(item.observacao) ? (
@@ -801,3 +807,6 @@ const ledgerValue: CSSProperties = {
   fontWeight: 950,
   whiteSpace: "nowrap",
 };
+
+
+

@@ -63,3 +63,8 @@ export function notifyNewOrder() {
   beep({ throttleMs: 2500, volume: 0.09, durationMs: 150, frequency: 920 });
   vibrate([90, 50, 90]);
 }
+
+export function notifyClientPush() {
+  beep({ throttleMs: 2500, volume: 0.08, durationMs: 130, frequency: 880 });
+  vibrate([70, 35, 70]);
+}

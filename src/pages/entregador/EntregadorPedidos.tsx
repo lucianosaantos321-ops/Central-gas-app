@@ -1,10 +1,18 @@
 import EntregadorLayout from "../../layouts/EntregadorLayout";
 import PageHeader from "../../components/PageHeader";
-import { useMemo, useState, type CSSProperties } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type CSSProperties,
+} from "react";
 import { useNavigate } from "react-router-dom";
 import { usePedidoStore } from "../../store/usePedidoStore";
-import { useEntregadorStore } from "../../store/useEntregadorStore";
+import { appLogger } from "../../services/appLogger";
+import { pedidoService } from "../../services/pedidoService";
 import { money, safeText, statusLabel, statusPill, getTime } from "../../utils/delivererHelpers";
+import { useEffectiveEntregadorId } from "../../hooks/useEffectiveEntregadorId";
 
 type ActiveFilter = "todos" | "preparando" | "emrota";
 
@@ -12,10 +20,36 @@ export default function EntregadorPedidos() {
   const navigate = useNavigate();
 
   const pedidos = usePedidoStore((s) => s.pedidos);
-  const entregadorId = useEntregadorStore((s) => s.entregadorId);
+  const loadingRemote = usePedidoStore((s) => s.loadingRemote);
+  const remoteReady = usePedidoStore((s) => s.remoteReady);
+  const refetchPedidos = usePedidoStore((s) => s.refetchPedidos);
+  const entregadorId = useEffectiveEntregadorId();
 
   const [filtro, setFiltro] = useState<ActiveFilter>("todos");
   const [busca, setBusca] = useState("");
+
+  const refreshPedidos = useCallback(async () => {
+    try {
+      await refetchPedidos();
+    } catch (error) {
+      appLogger.error("deliverer_pedidos", "refresh_pedidos_failed", error);
+    }
+  }, [refetchPedidos]);
+
+  useEffect(() => {
+    void refreshPedidos();
+    const stopRealtime = pedidoService.subscribePedidosRealtime(() => {
+      void refreshPedidos();
+    });
+    const timer = window.setInterval(() => {
+      void refreshPedidos();
+    }, 8000);
+
+    return () => {
+      stopRealtime();
+      window.clearInterval(timer);
+    };
+  }, [refreshPedidos]);
 
   const allActive = useMemo(() => {
     const base = Array.isArray(pedidos) ? pedidos : [];
@@ -93,6 +127,10 @@ export default function EntregadorPedidos() {
           title="Pedidos ativos"
           subtitle="Pedidos atribuídos a você e em andamento"
         />
+        <div style={syncLine}>
+          Atualização: {remoteReady ? "ao vivo" : "reconectando"}
+          {loadingRemote ? " • atualizando..." : ""}
+        </div>
 
         <div style={heroCard}>
           <div style={heroTop}>
@@ -219,7 +257,7 @@ export default function EntregadorPedidos() {
                   >
                     <div style={{ minWidth: 0, textAlign: "left" }}>
                       <div style={cardTop}>
-                        <div style={cardTitle}>Pedido nº {String(p.id).slice(0, 6)}</div>
+                        <div style={cardTitle}>Pedido # {String(p.id).slice(0, 6)}</div>
 
                         <span
                           style={{
@@ -537,3 +575,11 @@ const sideHint: CSSProperties = {
   fontWeight: 900,
   color: "#E44F2A",
 };
+
+const syncLine: CSSProperties = {
+  marginTop: -4,
+  fontSize: 12,
+  fontWeight: 800,
+  color: "#64748B",
+};
+

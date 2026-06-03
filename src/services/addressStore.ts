@@ -1,5 +1,12 @@
 // src/services/addressStore.ts
 import { v4 as uuid } from "uuid";
+import {
+  queueRemoteCurrentUserDocumentSave,
+} from "./remoteUserStateService";
+import {
+  readLocalUserDocumentPayload,
+  writeLocalUserDocumentPayload,
+} from "./userStateSchemas";
 
 export interface Address {
   id: string;
@@ -23,58 +30,66 @@ export interface Address {
   updatedAt?: string;
 }
 
-const STORAGE_KEY = "cg_addresses_v1";
-const PRIMARY_KEY = "cg_primary_address_id_v1";
-
-function safeParse<T>(raw: string | null, fallback: T): T {
-  if (!raw) return fallback;
-  try {
-    return JSON.parse(raw) as T;
-  } catch {
-    return fallback;
-  }
+function now() {
+  return new Date().toISOString();
 }
 
 function loadAddresses(): Address[] {
   if (typeof window === "undefined") return [];
-  const arr = safeParse<Address[]>(localStorage.getItem(STORAGE_KEY), []);
-  return Array.isArray(arr) ? arr : [];
+  const doc = readLocalUserDocumentPayload("client_addresses") as {
+    items?: Address[];
+  };
+  return Array.isArray(doc?.items) ? doc.items : [];
 }
 
 function saveAddresses(list: Address[]) {
   if (typeof window === "undefined") return;
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
-  } catch {
-    // ignore
-  }
+  const current = readLocalUserDocumentPayload("client_addresses") as {
+    primaryId?: string;
+  };
+  const next = {
+    items: Array.isArray(list) ? list : [],
+    primaryId: String(current?.primaryId ?? "").trim(),
+    updatedAt: now(),
+  };
+  writeLocalUserDocumentPayload("client_addresses", next);
+  queueRemoteCurrentUserDocumentSave("client_addresses", next);
 }
 
 function getPrimaryId(): string {
   if (typeof window === "undefined") return "";
-  try {
-    return localStorage.getItem(PRIMARY_KEY) || "";
-  } catch {
-    return "";
-  }
+  const doc = readLocalUserDocumentPayload("client_addresses") as {
+    primaryId?: string;
+  };
+  return String(doc?.primaryId ?? "").trim();
 }
 
 function setPrimaryId(id: string) {
   if (typeof window === "undefined") return;
-  try {
-    localStorage.setItem(PRIMARY_KEY, id);
-  } catch {
-    // ignore
-  }
+  const current = readLocalUserDocumentPayload("client_addresses") as {
+    items?: Address[];
+  };
+  const next = {
+    items: Array.isArray(current?.items) ? current.items : [],
+    primaryId: id,
+    updatedAt: now(),
+  };
+  writeLocalUserDocumentPayload("client_addresses", next);
+  queueRemoteCurrentUserDocumentSave("client_addresses", next);
 }
 
 function clearPrimaryId() {
   if (typeof window === "undefined") return;
-  try {
-    localStorage.removeItem(PRIMARY_KEY);
-  } catch {
-    // ignore
-  }
+  const current = readLocalUserDocumentPayload("client_addresses") as {
+    items?: Address[];
+  };
+  const next = {
+    items: Array.isArray(current?.items) ? current.items : [],
+    primaryId: "",
+    updatedAt: now(),
+  };
+  writeLocalUserDocumentPayload("client_addresses", next);
+  queueRemoteCurrentUserDocumentSave("client_addresses", next);
 }
 
 /** Leitura */
@@ -97,8 +112,9 @@ export function getPrimaryAddress(): Address | null {
 export function setPrimaryAddress(id: string) {
   const list = loadAddresses();
   const exists = list.some((a) => a.id === id);
-  if (!exists) return;
+  if (!exists) return false;
   setPrimaryId(id);
+  return true;
 }
 
 /** CRUD (persistente) */
@@ -107,8 +123,8 @@ export function createAddress(data: Omit<Address, "id" | "createdAt" | "updatedA
 
   const address: Address = {
     id: uuid(),
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    createdAt: now(),
+    updatedAt: now(),
 
     label: data.label,
     street: data.street,
@@ -143,7 +159,7 @@ export function updateAddress(
   const updated: Address = {
     ...list[idx],
     ...data,
-    updatedAt: new Date().toISOString(),
+    updatedAt: now(),
   };
 
   const next = [...list];

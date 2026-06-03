@@ -1,3 +1,5 @@
+import { queueRemoteDocumentSave } from "./remoteAppStateService";
+
 export type ClientCampaignSegment =
   | "vip"
   | "recorrentes"
@@ -40,7 +42,7 @@ function seed(): ClientCampaign[] {
       segmento: "vip",
       tituloInterno: "Campanha para clientes VIP",
       mensagemBase:
-        "Cliente premium. Preparar benefício especial, prioridade comercial ou ação de fidelização.",
+        "Cliente valioso. Preparar benefício especial, prioridade comercial ou ação de fidelização.",
       ativo: true,
       createdAt: t,
       updatedAt: t,
@@ -138,6 +140,7 @@ export const clientCampaignService = {
     };
 
     safeWrite([next, ...items]);
+    queueRemoteDocumentSave("client_campaigns", [next, ...items]);
     return next;
   },
 
@@ -167,12 +170,14 @@ export const clientCampaignService = {
     });
 
     safeWrite(updated);
+    queueRemoteDocumentSave("client_campaigns", updated);
     return updated.find((item) => item.id === id) ?? null;
   },
 
   remove(id: string) {
     const items = this.getAll().filter((item) => item.id !== id);
     safeWrite(items);
+    queueRemoteDocumentSave("client_campaigns", items);
     return true;
   },
 

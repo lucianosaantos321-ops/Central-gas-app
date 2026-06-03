@@ -1,5 +1,7 @@
 // src/services/realtimeBus.ts
 
+import type { NativeToastOptions } from "./nativeNotifications";
+
 export type ToastVariant = "info" | "success" | "warning" | "error";
 
 export type ToastPayload = {
@@ -37,6 +39,8 @@ const CHANNEL_NAME = "cg_realtime_channel";
 
 let channel: BroadcastChannel | null = null;
 const listeners = new Set<Listener>();
+const RECENT_TOAST_WINDOW_MS = 2200;
+const recentToastSignatures = new Map<string, number>();
 
 function notify(event: RealtimeEvent) {
   listeners.forEach((listener) => {
@@ -83,15 +87,39 @@ function emit(event: RealtimeEvent) {
   notify(event);
 }
 
+function shouldSkipDuplicateToast(signature: string) {
+  const now = Date.now();
+
+  for (const [key, timestamp] of recentToastSignatures.entries()) {
+    if (now - timestamp > RECENT_TOAST_WINDOW_MS) {
+      recentToastSignatures.delete(key);
+    }
+  }
+
+  const lastTimestamp = recentToastSignatures.get(signature);
+  recentToastSignatures.set(signature, now);
+  return typeof lastTimestamp === "number" && now - lastTimestamp < RECENT_TOAST_WINDOW_MS;
+}
+
 export function emitToast(
   title: string,
   message: string,
-  variant: ToastVariant = "info"
+  variant: ToastVariant = "info",
+  options: NativeToastOptions = {}
 ) {
+  const safeTitle = String(title || "").trim();
+  const safeMessage = String(message || "").trim();
+  const route = String(options.route || "").trim();
+
+  if (!safeTitle || !safeMessage) return;
+
+  const signature = [safeTitle, safeMessage, variant, route].join("|");
+  if (shouldSkipDuplicateToast(signature)) return;
+
   emit({
     type: "toast",
-    title,
-    message,
+    title: safeTitle,
+    message: safeMessage,
     variant,
   });
 }

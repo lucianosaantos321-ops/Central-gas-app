@@ -1,11 +1,15 @@
-import { useMemo, useState, type CSSProperties } from "react";
+﻿import { useMemo, useState, type CSSProperties } from "react";
 import AdminLayout from "../../layouts/AdminLayout";
 import { usePedidoStore } from "../../store/usePedidoStore";
+import { useRemoteSyncStore } from "../../store/useRemoteSyncStore";
+import { exportRowsToCsv } from "../../services/csvExportService";
 import {
   clientCampaignService,
   type ClientCampaignSegment,
 } from "../../services/clientCampaignService";
 import { clientAdminService } from "../../services/clientAdminService";
+import { couponAdminService } from "../../services/couponAdminService";
+import { emitToast } from "../../services/realtimeBus";
 import { money, safeText } from "../../utils/delivererHelpers";
 
 function onlyDigits(value: string) {
@@ -50,36 +54,6 @@ function getSegmentLabel(segmento: ClientCampaignSegment) {
   }
 }
 
-function escapeCsv(value: unknown) {
-  const text = String(value ?? "");
-  const escaped = text.replace(/"/g, '""');
-  return `"${escaped}"`;
-}
-
-function exportRowsToCsv(filename: string, rows: Record<string, unknown>[]) {
-  if (!Array.isArray(rows) || rows.length === 0) {
-    alert("Não há dados para exportar.");
-    return;
-  }
-
-  const headers = Object.keys(rows[0]);
-  const csv = [
-    headers.map(escapeCsv).join(","),
-    ...rows.map((row) => headers.map((key) => escapeCsv(row[key])).join(",")),
-  ].join("\n");
-
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename.endsWith(".csv") ? filename : `${filename}.csv`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
 function clientTier(row: {
   totalPedidos: number;
   totalGasto: number;
@@ -105,6 +79,7 @@ function churnRisk(row: {
 
 export default function AdminClientesCampanhas() {
   const pedidos = usePedidoStore((s) => s.pedidos);
+  const adminVersion = useRemoteSyncStore((s) => s.adminVersion);
 
   const [refreshKey, setRefreshKey] = useState(0);
   const [selectedCampaignId, setSelectedCampaignId] = useState("");
@@ -116,7 +91,14 @@ export default function AdminClientesCampanhas() {
     ativo: true,
   });
 
-  const campaigns = useMemo(() => clientCampaignService.getAll(), [refreshKey]);
+  const campaigns = useMemo(
+    () => clientCampaignService.getAll(),
+    [refreshKey, adminVersion]
+  );
+  const couponRules = useMemo(
+    () => couponAdminService.getAll(),
+    [refreshKey, adminVersion]
+  );
 
   const clientRows = useMemo(() => {
     const all = Array.isArray(pedidos) ? pedidos : [];
@@ -205,7 +187,7 @@ export default function AdminClientesCampanhas() {
         adminStatus: admin.status,
       };
     });
-  }, [pedidos, refreshKey]);
+  }, [pedidos, refreshKey, adminVersion]);
 
   const selectedCampaign = useMemo(
     () => campaigns.find((item) => item.id === selectedCampaignId) ?? null,
@@ -234,8 +216,10 @@ export default function AdminClientesCampanhas() {
       churn: clientRows.filter((x) => x.churn === "Alto").length,
       ausentes: clientRows.filter((x) => x.ausenciaCount > 0).length,
       atencao: clientRows.filter((x) => x.adminStatus === "atencao").length,
+      cuponsAtivos: couponRules.filter((x) => x.ativo).length,
+      cuponsPrimeiraCompra: couponRules.filter((x) => x.primeiraCompraApenas).length,
     };
-  }, [campaigns, clientRows]);
+  }, [campaigns, clientRows, couponRules]);
 
   function refresh() {
     setRefreshKey((v) => v + 1);
@@ -268,17 +252,17 @@ export default function AdminClientesCampanhas() {
 
   function saveCampaign() {
     if (!form.nome.trim()) {
-      alert("Informe o nome da campanha.");
+      emitToast("Nome obrigatorio", "Informe o nome da campanha.", "warning");
       return;
     }
 
     if (!form.tituloInterno.trim()) {
-      alert("Informe o título interno.");
+      emitToast("Titulo obrigatorio", "Informe o titulo interno.", "warning");
       return;
     }
 
     if (!form.mensagemBase.trim()) {
-      alert("Informe a mensagem base.");
+      emitToast("Mensagem obrigatoria", "Informe a mensagem base.", "warning");
       return;
     }
 
@@ -290,7 +274,7 @@ export default function AdminClientesCampanhas() {
         mensagemBase: form.mensagemBase.trim(),
         ativo: form.ativo,
       });
-      alert("Campanha atualizada ✅");
+      emitToast("Campanha atualizada", "A campanha foi atualizada.", "success");
     } else {
       clientCampaignService.create({
         nome: form.nome.trim(),
@@ -299,7 +283,7 @@ export default function AdminClientesCampanhas() {
         mensagemBase: form.mensagemBase.trim(),
         ativo: form.ativo,
       });
-      alert("Campanha criada ✅");
+      emitToast("Campanha criada", "A campanha foi criada.", "success");
     }
 
     resetForm();
@@ -313,7 +297,7 @@ export default function AdminClientesCampanhas() {
     if (!ok) return;
 
     clientCampaignService.remove(selectedCampaign.id);
-    alert("Campanha removida ✅");
+    emitToast("Campanha removida", "A campanha foi removida.", "success");
     resetForm();
     refresh();
   }
@@ -349,8 +333,8 @@ export default function AdminClientesCampanhas() {
 
   return (
     <AdminLayout
-      title="Campanhas de clientes"
-      subtitle="Segmentação comercial interna para VIP, recorrentes, churn, ausentes e clientes em atenção"
+      title="Campanhas"
+      subtitle="Segmentos, cupons e regras para trazer clientes de volta ao app."
     >
       <div style={heroGrid}>
         <MetricCard label="Campanhas" value={String(summary.totalCampanhas)} />
@@ -369,6 +353,71 @@ export default function AdminClientesCampanhas() {
       <div style={contentGrid}>
         <div style={sectionCard}>
           <div style={sectionHeader}>
+            <div style={sectionTitle}>Cupons e regras</div>
+            <span style={countPill}>{couponRules.length}</span>
+          </div>
+
+          <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
+            {couponRules.length === 0 ? (
+              <div style={emptyText}>Nenhum cupom criado ainda.</div>
+            ) : (
+              couponRules.slice(0, 6).map((item) => (
+                <div key={item.id} style={eligibleRow}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={eligibleTitle}>{item.codigo} - {item.titulo}</div>
+                    <div style={eligibleMeta}>
+                      {item.ativo ? "Ativo" : "Inativo"} | {item.tipo} | usados {item.usados}
+                    </div>
+                    <div style={eligibleMeta}>
+                      {item.primeiraCompraApenas ? "Primeira compra | " : ""}
+                      {item.usoUnicoPorCliente ? "Uso unico por cliente | " : ""}
+                      {item.expiraEm
+                        ? `Expira ${new Date(item.expiraEm).toLocaleString("pt-BR")}`
+                        : "Sem validade"}
+                    </div>
+                  </div>
+
+                  <div style={{ textAlign: "right" }}>
+                    <div style={eligibleValue}>{item.usoMaximo ?? "Livre"}</div>
+                    <div style={eligibleMeta}>Limite</div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        <div style={sectionCard}>
+          <div style={sectionHeader}>
+            <div style={sectionTitle}>Regras recomendadas</div>
+          </div>
+
+          <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
+            <div style={previewCard}>
+              <div style={previewTitleText}>Boas-vindas</div>
+              <div style={previewMessageText}>
+                Use "somente primeira compra" e "uso unico por cliente" para evitar repeticao.
+              </div>
+            </div>
+            <div style={previewCard}>
+              <div style={previewTitleText}>Promocao relampago</div>
+              <div style={previewMessageText}>
+                Defina validade com hora exata. Ao vencer, o cupom fica inativo automaticamente.
+              </div>
+            </div>
+            <div style={previewCard}>
+              <div style={previewTitleText}>Reativacao</div>
+              <div style={previewMessageText}>
+                Combine segmento de clientes ausentes com disparo para abrir direto na loja.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style={contentGrid}>
+        <div style={sectionCard}>
+          <div style={sectionHeader}>
             <div style={sectionTitle}>Campanhas cadastradas</div>
             <span style={countPill}>{campaigns.length}</span>
           </div>
@@ -380,7 +429,7 @@ export default function AdminClientesCampanhas() {
                   <div style={{ minWidth: 0, textAlign: "left" }}>
                     <div style={campaignTitle}>{item.nome}</div>
                     <div style={campaignMeta}>
-                      {getSegmentLabel(item.segmento)} • {item.ativo ? "Ativa" : "Inativa"}
+                      {getSegmentLabel(item.segmento)} | {item.ativo ? "Ativa" : "Inativa"}
                     </div>
                   </div>
 
@@ -522,7 +571,7 @@ export default function AdminClientesCampanhas() {
                   <div style={{ minWidth: 0 }}>
                     <div style={eligibleTitle}>{row.nome}</div>
                     <div style={eligibleMeta}>
-                      {row.totalPedidos} pedido(s) • {money(row.totalGasto)}
+                      {row.totalPedidos} pedido(s) | {money(row.totalGasto)}
                     </div>
                   </div>
 
@@ -863,3 +912,6 @@ const emptyText: CSSProperties = {
   color: "#64748B",
   lineHeight: 1.5,
 };
+
+
+

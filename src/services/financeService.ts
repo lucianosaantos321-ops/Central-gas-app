@@ -4,14 +4,18 @@ import type {
   Pedido,
 } from "../types";
 import { adminRulesService } from "./adminRulesService";
-
-type FinanceDb = {
-  byDeliverer: Record<string, DelivererFinancialState>;
-};
+import {
+  appendManualFinanceEvent,
+  extractManualFinanceEvents,
+  readFinanceDb,
+  writeFinanceDb,
+} from "./financeStorage";
+import { queueRemoteFinanceEventSave } from "./remoteFinanceStateService";
 
 export const COMISSAO_APP_POR_ENTREGA = 10;
 
-const STORAGE_KEY = "cg_finance_state_v2";
+let deliveredPedidosCache: Pedido[] = [];
+const recentMutationGuards = new Map<string, number>();
 
 function now() {
   return new Date().toISOString();
@@ -25,51 +29,38 @@ function round2(value: number) {
   return Number(Number(value || 0).toFixed(2));
 }
 
-function safeRead(): FinanceDb {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { byDeliverer: {} };
-
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return { byDeliverer: {} };
-
-    const byDeliverer =
-      parsed.byDeliverer && typeof parsed.byDeliverer === "object"
-        ? parsed.byDeliverer
-        : {};
-
-    return { byDeliverer };
-  } catch {
-    return { byDeliverer: {} };
+function cleanupMutationGuards(referenceTime: number) {
+  for (const [key, value] of recentMutationGuards.entries()) {
+    if (referenceTime - value > 8000) {
+      recentMutationGuards.delete(key);
+    }
   }
 }
 
-function safeWrite(db: FinanceDb) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
-  } catch {
-    // ignore
-  }
+function isRecentDuplicateMutation(parts: Array<string | number>) {
+  const nowMs = Date.now();
+  cleanupMutationGuards(nowMs);
+
+  const key = parts.map((item) => String(item ?? "").trim().toLowerCase()).join("|");
+  const previous = recentMutationGuards.get(key) ?? 0;
+  recentMutationGuards.set(key, nowMs);
+  return previous > 0 && nowMs - previous < 4000;
 }
 
-function createEmptyState(entregadorId: string): DelivererFinancialState {
-  const rules = adminRulesService.getRules();
-
-  return {
-    entregadorId,
-    saldoDevedor: 0,
-    limiteBloqueio: Number(rules.limiteBloqueioSaldo || 300),
-    bloqueado: false,
-    updatedAt: now(),
-    historico: [],
-  };
+function getPedidoTime(pedido: Pedido) {
+  const parsed = new Date(pedido.updatedAt ?? pedido.createdAt ?? 0).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function recalcState(base: DelivererFinancialState): DelivererFinancialState {
-  const rules = adminRulesService.getRules();
+function sortHistory(items: FinanceHistoryItem[]) {
+  return [...items].sort(
+    (a, b) => new Date(b.data).getTime() - new Date(a.data).getTime()
+  );
+}
 
-  const saldo = round2(
-    (Array.isArray(base.historico) ? base.historico : []).reduce((acc, item) => {
+function composeSaldo(historico: FinanceHistoryItem[]) {
+  return round2(
+    (historico || []).reduce((acc, item) => {
       if (item.tipo === "pagamento") {
         return acc - Math.abs(Number(item.valor || 0));
       }
@@ -77,217 +68,217 @@ function recalcState(base: DelivererFinancialState): DelivererFinancialState {
       return acc + Number(item.valor || 0);
     }, 0)
   );
+}
 
+function getManualHistory(entregadorId: string) {
+  return extractManualFinanceEvents(readFinanceDb())
+    .filter((item) => normalizeId(item.entregadorId) === normalizeId(entregadorId))
+    .map((item) => ({
+      tipo: item.tipo,
+      valor: Number(item.valor || 0),
+      observacao: item.observacao ?? null,
+      data: item.data,
+      pedidoId: item.pedidoId,
+    }));
+}
+
+function getCommissionHistory(entregadorId: string) {
+  const rules = adminRulesService.getRules();
+  const commissionDefault = Number(
+    rules.comissaoPorEntrega || COMISSAO_APP_POR_ENTREGA
+  );
+
+  const delivered = deliveredPedidosCache
+    .filter(
+      (pedido) =>
+        normalizeId(String(pedido.entregadorId || "")) === normalizeId(entregadorId) &&
+        pedido.status === "entregue"
+    )
+    .sort((a, b) => getPedidoTime(b) - getPedidoTime(a));
+
+  const byPedidoId = new Map<string, FinanceHistoryItem>();
+
+  for (const pedido of delivered) {
+    const pedidoId = normalizeId(String(pedido.id || ""));
+    if (!pedidoId || byPedidoId.has(pedidoId)) continue;
+
+    const valor = round2(
+      Number(
+        pedido.comissaoApp != null ? pedido.comissaoApp : commissionDefault
+      )
+    );
+
+    byPedidoId.set(pedidoId, {
+      tipo: "comissao",
+      valor,
+      pedidoId,
+      observacao: `Comissao da entrega ${pedidoId.slice(0, 6)}`,
+      data: pedido.updatedAt || pedido.createdAt || now(),
+    });
+  }
+
+  return Array.from(byPedidoId.values());
+}
+
+function buildState(entregadorId: string): DelivererFinancialState {
+  const id = normalizeId(entregadorId);
+  const rules = adminRulesService.getRules();
+  const historico = sortHistory([
+    ...getManualHistory(id),
+    ...getCommissionHistory(id),
+  ]);
+  const saldoDevedor = composeSaldo(historico);
   const limiteBloqueio = Number(rules.limiteBloqueioSaldo || 300);
 
   return {
-    ...base,
-    saldoDevedor: saldo,
+    entregadorId: id,
+    saldoDevedor,
     limiteBloqueio,
-    bloqueado: saldo >= limiteBloqueio,
+    bloqueado: saldoDevedor >= limiteBloqueio,
     updatedAt: now(),
-    historico: [...(base.historico || [])].sort(
-      (a, b) => new Date(b.data).getTime() - new Date(a.data).getTime()
-    ),
+    historico,
   };
 }
 
-function ensureDeliverer(db: FinanceDb, entregadorId: string) {
-  const id = normalizeId(entregadorId);
-  if (!id) return null;
-
-  if (!db.byDeliverer[id]) {
-    db.byDeliverer[id] = createEmptyState(id);
-  }
-
-  db.byDeliverer[id] = recalcState(db.byDeliverer[id]);
-  return db.byDeliverer[id];
-}
-
-function historyHasCommissionForPedido(
-  historico: FinanceHistoryItem[],
-  pedidoId: string
-) {
-  return (historico || []).some(
-    (item) =>
-      item.tipo === "comissao" &&
-      String(item.pedidoId || "") === String(pedidoId || "")
+function collectDelivererIds() {
+  const manualIds = extractManualFinanceEvents(readFinanceDb()).map((item) =>
+    normalizeId(item.entregadorId)
   );
+  const orderIds = deliveredPedidosCache.map((pedido) =>
+    normalizeId(String(pedido.entregadorId || ""))
+  );
+
+  return Array.from(new Set([...manualIds, ...orderIds].filter(Boolean)));
 }
 
 export const financeService = {
   getDelivererState(entregadorId: string): DelivererFinancialState {
     const id = normalizeId(entregadorId);
-    if (!id) return createEmptyState("");
-
-    const db = safeRead();
-    const state = ensureDeliverer(db, id) || createEmptyState(id);
-    safeWrite(db);
-    return state;
+    if (!id) return buildState("");
+    return buildState(id);
   },
 
   getAllDelivererStates(): DelivererFinancialState[] {
-    const db = safeRead();
-    const ids = Object.keys(db.byDeliverer || {});
-
-    const states = ids
-      .map((id) => ensureDeliverer(db, id))
-      .filter(Boolean) as DelivererFinancialState[];
-
-    safeWrite(db);
-
-    return states.sort(
-      (a, b) => Number(b.saldoDevedor || 0) - Number(a.saldoDevedor || 0)
-    );
+    return collectDelivererIds()
+      .map((entregadorId) => this.getDelivererState(entregadorId))
+      .sort(
+        (a, b) => Number(b.saldoDevedor || 0) - Number(a.saldoDevedor || 0)
+      );
   },
 
   isBloqueado(entregadorId: string): boolean {
-    const state = this.getDelivererState(entregadorId);
-    return Boolean(state.bloqueado);
+    return Boolean(this.getDelivererState(entregadorId).bloqueado);
   },
 
   getHistorico(entregadorId: string) {
-    const state = this.getDelivererState(entregadorId);
-    return Array.isArray(state.historico) ? state.historico : [];
+    return Array.isArray(this.getDelivererState(entregadorId).historico)
+      ? this.getDelivererState(entregadorId).historico
+      : [];
   },
 
   addAjuste(entregadorId: string, valor: number, observacao?: string | null) {
     const id = normalizeId(entregadorId);
-    if (!id) return null;
-
     const amount = round2(Number(valor || 0));
-    if (!Number.isFinite(amount) || amount === 0) return null;
+    if (!id || !Number.isFinite(amount) || amount === 0) return null;
+    if (
+      isRecentDuplicateMutation([
+        "ajuste",
+        id,
+        amount,
+        observacao?.trim() || "Ajuste manual",
+      ])
+    ) {
+      return this.getDelivererState(id);
+    }
 
-    const db = safeRead();
-    const state = ensureDeliverer(db, id);
-    if (!state) return null;
-
-    state.historico.unshift({
+    const db = readFinanceDb();
+    const event = appendManualFinanceEvent(db, {
+      entregadorId: id,
       tipo: "ajuste",
       valor: amount,
       observacao: observacao?.trim() || "Ajuste manual",
-      data: now(),
+    });
+    if (!event) return null;
+
+    writeFinanceDb(db);
+    queueRemoteFinanceEventSave({
+      entregadorId: id,
+      tipo: "ajuste",
+      valor: amount,
+      observacao: event.observacao ?? null,
+      data: event.data,
     });
 
-    db.byDeliverer[id] = recalcState(state);
-    safeWrite(db);
-    return db.byDeliverer[id];
+    return this.getDelivererState(id);
   },
 
   registerPagamento(entregadorId: string, valor: number, observacao?: string | null) {
     const id = normalizeId(entregadorId);
-    if (!id) return null;
-
     const amount = Math.abs(round2(Number(valor || 0)));
-    if (!Number.isFinite(amount) || amount <= 0) return null;
+    if (!id || !Number.isFinite(amount) || amount <= 0) return null;
+    if (
+      isRecentDuplicateMutation([
+        "pagamento",
+        id,
+        amount,
+        observacao?.trim() || "Pagamento registrado pelo ADM",
+      ])
+    ) {
+      return this.getDelivererState(id);
+    }
 
-    const db = safeRead();
-    const state = ensureDeliverer(db, id);
-    if (!state) return null;
-
-    state.historico.unshift({
+    const db = readFinanceDb();
+    const event = appendManualFinanceEvent(db, {
+      entregadorId: id,
       tipo: "pagamento",
       valor: amount,
       observacao: observacao?.trim() || "Pagamento registrado pelo ADM",
-      data: now(),
+    });
+    if (!event) return null;
+
+    writeFinanceDb(db);
+    queueRemoteFinanceEventSave({
+      entregadorId: id,
+      tipo: "pagamento",
+      valor: amount,
+      observacao: event.observacao ?? null,
+      data: event.data,
     });
 
-    db.byDeliverer[id] = recalcState(state);
-    safeWrite(db);
-    return db.byDeliverer[id];
+    return this.getDelivererState(id);
   },
 
-  addComissao(entregadorId: string, pedidoId: string, valor?: number) {
+  addComissao(entregadorId: string, _pedidoId: string, _valor?: number) {
     const id = normalizeId(entregadorId);
-    const pedidoNormalizado = String(pedidoId || "").trim();
-
-    if (!id || !pedidoNormalizado) return null;
-
-    const db = safeRead();
-    const state = ensureDeliverer(db, id);
-    if (!state) return null;
-
-    if (historyHasCommissionForPedido(state.historico || [], pedidoNormalizado)) {
-      return db.byDeliverer[id];
-    }
-
-    const rules = adminRulesService.getRules();
-    const valorComissao = round2(
-      Number(
-        valor != null
-          ? valor
-          : rules.comissaoPorEntrega || COMISSAO_APP_POR_ENTREGA
-      )
-    );
-
-    state.historico.unshift({
-      tipo: "comissao",
-      valor: valorComissao,
-      pedidoId: pedidoNormalizado,
-      observacao: `Comissão da entrega ${pedidoNormalizado.slice(0, 6)}`,
-      data: now(),
-    });
-
-    db.byDeliverer[id] = recalcState(state);
-    safeWrite(db);
-    return db.byDeliverer[id];
+    if (!id) return null;
+    return this.getDelivererState(id);
   },
 
   syncDeliveredOrders(pedidos: Pedido[]) {
-    const db = safeRead();
-    const rules = adminRulesService.getRules();
-    const commissionDefault = Number(
-      rules.comissaoPorEntrega || COMISSAO_APP_POR_ENTREGA
-    );
+    const latest = new Map<string, Pedido>();
 
-    const delivered = (Array.isArray(pedidos) ? pedidos : []).filter(
-      (pedido) =>
-        pedido &&
-        pedido.status === "entregue" &&
-        normalizeId(String(pedido.entregadorId || ""))
-    );
+    for (const pedido of Array.isArray(pedidos) ? pedidos : []) {
+      if (!pedido || pedido.status !== "entregue") continue;
+      const id = normalizeId(String(pedido.id || ""));
+      if (!id) continue;
 
-    let changed = false;
-
-    delivered.forEach((pedido) => {
-      const entregadorId = normalizeId(String(pedido.entregadorId || ""));
-      if (!entregadorId) return;
-
-      const state = ensureDeliverer(db, entregadorId);
-      if (!state) return;
-
-      if (historyHasCommissionForPedido(state.historico, pedido.id)) {
-        return;
+      const existing = latest.get(id);
+      if (!existing || getPedidoTime(pedido) >= getPedidoTime(existing)) {
+        latest.set(id, pedido);
       }
-
-      const valorComissao = round2(
-        Number(
-          pedido.comissaoApp != null ? pedido.comissaoApp : commissionDefault
-        )
-      );
-
-      state.historico.unshift({
-        tipo: "comissao",
-        valor: valorComissao,
-        pedidoId: pedido.id,
-        observacao: `Comissão da entrega ${String(pedido.id).slice(0, 6)}`,
-        data: pedido.updatedAt || pedido.createdAt || now(),
-      });
-
-      db.byDeliverer[entregadorId] = recalcState(state);
-      changed = true;
-    });
-
-    if (changed) {
-      safeWrite(db);
     }
+
+    deliveredPedidosCache = Array.from(latest.values()).sort(
+      (a, b) => getPedidoTime(b) - getPedidoTime(a)
+    );
 
     return this.getAllDelivererStates();
   },
 
   getGlobalSummary(pedidos: Pedido[]) {
-    const synced = this.syncDeliveredOrders(pedidos);
-    const states = Array.isArray(synced) ? synced : this.getAllDelivererStates();
+    const states = Array.isArray(pedidos)
+      ? this.syncDeliveredOrders(pedidos)
+      : this.getAllDelivererStates();
 
     const historico = states.flatMap((item) => item.historico || []);
 

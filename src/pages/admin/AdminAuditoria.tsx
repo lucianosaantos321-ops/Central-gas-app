@@ -1,5 +1,6 @@
-import { useMemo, useState, type CSSProperties } from "react";
+﻿import { useMemo, useState, type CSSProperties } from "react";
 import AdminLayout from "../../layouts/AdminLayout";
+import { exportRowsToCsv } from "../../services/csvExportService";
 import { usePedidoStore } from "../../store/usePedidoStore";
 import { money, safeText, statusLabel } from "../../utils/delivererHelpers";
 
@@ -11,36 +12,6 @@ type AuditFilter =
   | "cancelados_cliente"
   | "cancelados_adm"
   | "entregas_manuais";
-
-function escapeCsv(value: unknown) {
-  const text = String(value ?? "");
-  const escaped = text.replace(/"/g, '""');
-  return `"${escaped}"`;
-}
-
-function exportRowsToCsv(filename: string, rows: Record<string, unknown>[]) {
-  if (!Array.isArray(rows) || rows.length === 0) {
-    alert("Não há dados para exportar.");
-    return;
-  }
-
-  const headers = Object.keys(rows[0]);
-  const csv = [
-    headers.map(escapeCsv).join(","),
-    ...rows.map((row) => headers.map((key) => escapeCsv(row[key])).join(","))
-  ].join("\n");
-
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename.endsWith(".csv") ? filename : `${filename}.csv`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
 
 function getRiskScore(pedido: any) {
   let score = 0;
@@ -262,10 +233,10 @@ export default function AdminAuditoria() {
                       Pedido #{String(pedido.id).slice(0, 6)}
                     </div>
                     <div style={rowMeta}>
-                      {safeText(pedido.clienteNome) || "Cliente"} • {statusLabel(pedido.status)}
+                      {safeText(pedido.clienteNome) || "Cliente"} | {statusLabel(pedido.status)}
                     </div>
                     <div style={rowMetaSecondary}>
-                      {pedido.canceladoPor ? `Cancelado por: ${pedido.canceladoPor}` : `Confirmação: ${pedido.deliveryConfirmationMethod || "—"}`}
+                      {pedido.canceladoPor ? `Cancelado por: ${pedido.canceladoPor}` : `Confirmação: ${pedido.deliveryConfirmationMethod || "-"}`}
                     </div>
                   </div>
 
@@ -315,17 +286,17 @@ export default function AdminAuditoria() {
                 <DetailBox label="Status" value={statusLabel(selected.status)} />
                 <DetailBox label="Total" value={money(Number(selected.total || 0))} />
                 <DetailBox label="Risco" value={`${selected.riskLabel} (${selected.riskScore})`} />
-                <DetailBox label="Confirmação entrega" value={safeText(selected.deliveryConfirmationMethod) || "—"} />
+                <DetailBox label="Confirmação entrega" value={safeText(selected.deliveryConfirmationMethod) || "-"} />
               </div>
 
               <div style={subCard}>
                 <div style={subTitle}>Dados de cancelamento</div>
 
                 <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
-                  <AuditLine label="Cancelado por" value={safeText(selected.canceladoPor) || "—"} />
+                  <AuditLine label="Cancelado por" value={safeText(selected.canceladoPor) || "-"} />
                   <AuditLine label="Auditável" value={selected.cancelamentoAuditavel ? "Sim" : "Não"} />
                   <AuditLine label="Suspeito" value={selected.cancelamentoSuspeito ? "Sim" : "Não"} danger={selected.cancelamentoSuspeito} />
-                  <AuditLine label="Data" value={selected.canceladoEm ? new Date(selected.canceladoEm).toLocaleString("pt-BR") : "—"} />
+                  <AuditLine label="Data" value={selected.canceladoEm ? new Date(selected.canceladoEm).toLocaleString("pt-BR") : "-"} />
                 </div>
 
                 {safeText(selected.motivoCancelamento) ? (
@@ -357,8 +328,8 @@ export default function AdminAuditoria() {
                 </div>
 
                 <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
-                  <AuditLine label="Lat cancelamento" value={selected.cancelamentoLat != null ? String(selected.cancelamentoLat) : "—"} />
-                  <AuditLine label="Lng cancelamento" value={selected.cancelamentoLng != null ? String(selected.cancelamentoLng) : "—"} />
+                  <AuditLine label="Lat cancelamento" value={selected.cancelamentoLat != null ? String(selected.cancelamentoLat) : "-"} />
+                  <AuditLine label="Lng cancelamento" value={selected.cancelamentoLng != null ? String(selected.cancelamentoLng) : "-"} />
                 </div>
               </div>
 
@@ -720,3 +691,5 @@ const insightText: CSSProperties = {
   lineHeight: 1.55,
   fontWeight: 800,
 };
+
+

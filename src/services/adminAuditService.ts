@@ -49,14 +49,14 @@ function safeText(value: unknown) {
 
 function formatEndereco(p: Pedido) {
   const e = p?.enderecoSnapshot;
-  if (!e) return "Não informado";
+  if (!e) return "Nao informado";
 
   const rua = safeText(e.street ?? e.rua);
   const numero = safeText(e.number ?? e.numero);
   const bairro = safeText(e.neighborhood ?? e.bairro);
   const cidade = safeText(e.city ?? e.cidade);
 
-  return [rua, numero, bairro, cidade].filter(Boolean).join(", ") || "Não informado";
+  return [rua, numero, bairro, cidade].filter(Boolean).join(", ") || "Nao informado";
 }
 
 export const adminAuditService = {
@@ -68,12 +68,12 @@ export const adminAuditService = {
       .map((p) => ({
         pedidoId: String(p.id),
         clienteNome: safeText(p.clienteNome) || "Cliente",
-        clienteTelefone: safeText(p.clienteTelefone) || "Não informado",
+        clienteTelefone: safeText(p.clienteTelefone) || "Nao informado",
         entregadorId: safeText(p.entregadorId) || "Sem entregador",
         status: safeText(p.status),
         motivoCancelamento: safeText(p.motivoCancelamento) || "Sem motivo",
-        observacaoCancelamento: safeText(p.observacaoCancelamento) || "Sem observação",
-        canceladoPor: safeText(p.canceladoPor) || "Não informado",
+        observacaoCancelamento: safeText(p.observacaoCancelamento) || "Sem observacao",
+        canceladoPor: safeText(p.canceladoPor) || "Nao informado",
         canceladoEm: safeText(p.canceladoEm) || safeText(p.updatedAt) || safeText(p.createdAt),
         cancelamentoAuditavel: Boolean(p.cancelamentoAuditavel),
         cancelamentoSuspeito: Boolean(p.cancelamentoSuspeito),

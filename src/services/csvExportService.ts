@@ -1,3 +1,5 @@
+import { emitToast } from "./realtimeBus";
+
 function escapeCsv(value: unknown) {
   const text = String(value ?? "");
   const escaped = text.replace(/"/g, '""');
@@ -6,8 +8,8 @@ function escapeCsv(value: unknown) {
 
 export function exportRowsToCsv(filename: string, rows: Record<string, unknown>[]) {
   if (!Array.isArray(rows) || rows.length === 0) {
-    alert("Não há dados para exportar.");
-    return;
+    emitToast("Nada para exportar", "Nao ha dados disponiveis para gerar o CSV.", "warning");
+    return false;
   }
 
   const headers = Object.keys(rows[0]);
@@ -19,12 +21,14 @@ export function exportRowsToCsv(filename: string, rows: Record<string, unknown>[
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
 
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename.endsWith(".csv") ? filename : `${filename}.csv`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename.endsWith(".csv") ? filename : `${filename}.csv`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
 
   URL.revokeObjectURL(url);
+  emitToast("Exportacao concluida", `Arquivo ${anchor.download} pronto para download.`, "success");
+  return true;
 }

@@ -1,8 +1,26 @@
 import { createClient } from "@supabase/supabase-js";
 
-const FALLBACK_URL = "https://gywmqhqiqldulzgxmjjs.supabase.co";
-const FALLBACK_PUBLISHABLE_KEY =
+const EMBEDDED_FALLBACK_URL = "https://gywmqhqiqldulzgxmjjs.supabase.co";
+const EMBEDDED_FALLBACK_PUBLISHABLE_KEY =
   "sb_publishable_sxQCNvp72plz_0vDKPicAA_qt0tviAp";
+
+function safeGetEnv(key: string) {
+  const value = import.meta.env[key as keyof ImportMetaEnv];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function parseBooleanEnv(value: string) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes";
+}
+
+const ALLOW_RUNTIME_STORAGE_CONFIG =
+  import.meta.env.DEV ||
+  parseBooleanEnv(safeGetEnv("VITE_ALLOW_RUNTIME_STORAGE_SUPABASE_CONFIG"));
+
+const ALLOW_EMBEDDED_SUPABASE_FALLBACK =
+  import.meta.env.DEV ||
+  parseBooleanEnv(safeGetEnv("VITE_ALLOW_EMBEDDED_SUPABASE_FALLBACK"));
 
 function safeGetLocal(key: string) {
   try {
@@ -12,22 +30,36 @@ function safeGetLocal(key: string) {
   }
 }
 
-const url =
-  (import.meta.env.VITE_SUPABASE_URL as string | undefined)?.trim() ||
-  safeGetLocal("cg_supabase_url") ||
-  FALLBACK_URL;
+const configuredSupabaseUrl =
+  safeGetEnv("VITE_SUPABASE_URL") ||
+  (ALLOW_RUNTIME_STORAGE_CONFIG ? safeGetLocal("cg_supabase_url") : "") ||
+  (ALLOW_EMBEDDED_SUPABASE_FALLBACK ? EMBEDDED_FALLBACK_URL : "");
 
-const anonKey =
-  (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined)?.trim() ||
-  (import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string | undefined)?.trim() ||
-  safeGetLocal("cg_supabase_anon_key") ||
-  safeGetLocal("cg_supabase_publishable_key") ||
-  FALLBACK_PUBLISHABLE_KEY;
+const configuredSupabaseAnonKey =
+  safeGetEnv("VITE_SUPABASE_ANON_KEY") ||
+  safeGetEnv("VITE_SUPABASE_PUBLISHABLE_KEY") ||
+  (ALLOW_RUNTIME_STORAGE_CONFIG ? safeGetLocal("cg_supabase_anon_key") : "") ||
+  (ALLOW_RUNTIME_STORAGE_CONFIG ? safeGetLocal("cg_supabase_publishable_key") : "") ||
+  (ALLOW_EMBEDDED_SUPABASE_FALLBACK ? EMBEDDED_FALLBACK_PUBLISHABLE_KEY : "");
 
-export const supabase = createClient(url, anonKey, {
+if (!configuredSupabaseUrl || !configuredSupabaseAnonKey) {
+  throw new Error(
+    "SUPABASE_CONFIG_MISSING: configure VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY para este ambiente."
+  );
+}
+
+export const supabaseUrl = configuredSupabaseUrl;
+export const supabaseAnonKey = configuredSupabaseAnonKey;
+
+export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
   auth: {
-    persistSession: false,
-    autoRefreshToken: false,
+    persistSession: true,
+    autoRefreshToken: true,
     detectSessionInUrl: false,
+  },
+  realtime: {
+    params: {
+      eventsPerSecond: 10,
+    },
   },
 });
