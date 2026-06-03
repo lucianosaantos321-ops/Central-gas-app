@@ -15,3 +15,7 @@ assets/
 notification-dump.txt
 gerar_alerta_premium.js
 cg_*.png
+(
+{
+confirmAndChange(cancelled)}
+getOrders())
